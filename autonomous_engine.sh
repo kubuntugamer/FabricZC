@@ -112,7 +112,7 @@ FZC_CLEAN_MAKE
         # Implement an alternative python fallback block to wipe out structural string errors perfectly
         python3 -c '
 import os
-file_path = os.path.expanduser("~/experimental/amd-raid-driver/FabricZC/src/user/control.c")
+file_path = os.path.expanduser("~/experimental/FabricZC/src/user/control.c")
 if os.path.exists(file_path):
     with open(file_path, "r") as f:
         lines = f.readlines()
