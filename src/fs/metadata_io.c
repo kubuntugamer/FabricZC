@@ -312,6 +312,102 @@ int fabriczc_alloc_inode_slot(struct super_block *sb, u32 *out_ino)
     return -ENOSPC;
 }
 
+/*
+ * Index-table helpers for files past the single-indirect range.
+ * A zero pointer is treated as "unset" because images created before
+ * i_double_indirect_block existed carry a zero-filled tail.
+ */
+static bool fabriczc_table_ptr_unset(u32 blk)
+{
+    return blk == FABRICZC_BLOCK_FREE || blk == 0;
+}
+
+/* Allocate a 4 KiB index table and prefill it with FABRICZC_BLOCK_FREE */
+static int fabriczc_alloc_index_table(struct super_block *sb, u32 *out_blk)
+{
+    char *zero;
+    u32 blk;
+    int i, ret;
+
+    ret = fabriczc_alloc_data_block(sb, &blk);
+    if (ret) return ret;
+
+    zero = kzalloc(4096, GFP_KERNEL);
+    if (!zero) { fabriczc_free_data_block(sb, blk); return -ENOMEM; }
+    for (i = 0; i < FABRICZC_INDIRECT_ENTRIES; i++)
+        ((u32 *)zero)[i] = FABRICZC_BLOCK_FREE;
+    ret = fabriczc_write_block(sb, blk, zero, 4096);
+    kfree(zero);
+    if (ret) { fabriczc_free_data_block(sb, blk); return ret; }
+
+    *out_blk = blk;
+    return 0;
+}
+
+/*
+ * Double-indirect mapping: block i points at a table of single-indirect
+ * tables, each covering FABRICZC_INDIRECT_ENTRIES further file blocks.
+ * Raises the per-file ceiling from ~4 MiB to ~4 GiB.
+ */
+static int fabriczc_bmap_double_indirect(struct inode *inode, u32 iblock,
+                                         u32 *phys, bool create)
+{
+    struct super_block *sb = inode->i_sb;
+    struct fabriczc_inode *raw = inode->i_private;
+    u32 dind_slot = iblock / FABRICZC_INDIRECT_ENTRIES;
+    u32 leaf_slot = iblock % FABRICZC_INDIRECT_ENTRIES;
+    u32 leaf_blk, data_blk;
+    char *table;
+    int ret;
+
+    if (unlikely(!sb || !raw)) return -EINVAL;
+    if (dind_slot >= FABRICZC_INDIRECT_ENTRIES) return -EFBIG;
+
+    if (fabriczc_table_ptr_unset(raw->i_double_indirect_block)) {
+        if (!create) { *phys = FABRICZC_BLOCK_FREE; return 0; }
+        ret = fabriczc_alloc_index_table(sb, &raw->i_double_indirect_block);
+        if (ret) return ret;
+        raw->i_blocks_allocated += 8;
+        fabriczc_inode_slot_write(sb, inode->i_ino, raw);
+    }
+
+    table = kmalloc(4096, GFP_KERNEL);
+    if (!table) return -ENOMEM;
+    ret = fabriczc_read_block(sb, raw->i_double_indirect_block, table, 4096);
+    if (ret) { kfree(table); return ret; }
+    leaf_blk = ((u32 *)table)[dind_slot];
+    if (fabriczc_table_ptr_unset(leaf_blk)) {
+        if (!create) { kfree(table); *phys = FABRICZC_BLOCK_FREE; return 0; }
+        ret = fabriczc_alloc_index_table(sb, &leaf_blk);
+        if (ret) { kfree(table); return ret; }
+        ((u32 *)table)[dind_slot] = leaf_blk;
+        ret = fabriczc_write_block(sb, raw->i_double_indirect_block, table, 4096);
+        if (ret) { kfree(table); return ret; }
+        raw->i_blocks_allocated += 8;
+        fabriczc_inode_slot_write(sb, inode->i_ino, raw);
+    }
+    kfree(table);
+
+    table = kmalloc(4096, GFP_KERNEL);
+    if (!table) return -ENOMEM;
+    ret = fabriczc_read_block(sb, leaf_blk, table, 4096);
+    if (ret) { kfree(table); return ret; }
+    data_blk = ((u32 *)table)[leaf_slot];
+    if (fabriczc_table_ptr_unset(data_blk)) {
+        if (!create) { kfree(table); *phys = FABRICZC_BLOCK_FREE; return 0; }
+        ret = fabriczc_alloc_data_block(sb, &data_blk);
+        if (ret) { kfree(table); return ret; }
+        ((u32 *)table)[leaf_slot] = data_blk;
+        ret = fabriczc_write_block(sb, leaf_blk, table, 4096);
+        if (ret) { kfree(table); return ret; }
+        raw->i_blocks_allocated += 8;
+        fabriczc_inode_slot_write(sb, inode->i_ino, raw);
+    }
+    *phys = data_blk;
+    kfree(table);
+    return 0;
+}
+
 int fabriczc_bmap_block(struct inode *inode, u32 iblock, u32 *phys, bool create)
 {
     struct super_block *sb = inode->i_sb;
@@ -334,6 +430,10 @@ int fabriczc_bmap_block(struct inode *inode, u32 iblock, u32 *phys, bool create)
     }
 
     iblock -= FABRICZC_N_DIRECT_BLOCKS;
+    if (iblock >= FABRICZC_INDIRECT_ENTRIES)
+        return fabriczc_bmap_double_indirect(inode, iblock - FABRICZC_INDIRECT_ENTRIES,
+                                             phys, create);
+
     if (raw->i_indirect_block == FABRICZC_BLOCK_FREE) {
         u32 ind;
         if (!create) { *phys = FABRICZC_BLOCK_FREE; return 0; }
@@ -352,7 +452,6 @@ int fabriczc_bmap_block(struct inode *inode, u32 iblock, u32 *phys, bool create)
         raw->i_blocks_allocated += 8;
         fabriczc_inode_slot_write(sb, inode->i_ino, raw);
     }
-    if (iblock >= 1024) return -EFBIG;
     {
         char *ind = kmalloc(4096, GFP_KERNEL);
         if (!ind) return -ENOMEM;
@@ -377,13 +476,19 @@ int fabriczc_bmap_block(struct inode *inode, u32 iblock, u32 *phys, bool create)
     }
 }
 
+/*
+ * Buffer_head callers (mpage writeback, bmap) pass filesystem-relative block
+ * numbers, while map_bh()/b_blocknr are in 512-byte sectors. Shifting the
+ * incoming block number as well made every page of a range resolve to the same
+ * logical block, which surfaced as -EIO on the first msync().
+ */
 int fabriczc_get_block(struct inode *inode, sector_t iblock, struct buffer_head *bh_result, int create)
 {
     u32 phys;
-    int ret = fabriczc_bmap_block(inode, (u32)(iblock >> (inode->i_sb->s_blocksize_bits - 9)), &phys, create != 0);
+    int ret = fabriczc_bmap_block(inode, (u32)iblock, &phys, create != 0);
     if (ret) return ret;
     if (phys == FABRICZC_BLOCK_FREE) return 0;
-    map_bh(bh_result, inode->i_sb, phys << (inode->i_sb->s_blocksize_bits - 9));
+    map_bh(bh_result, inode->i_sb, (sector_t)phys << (inode->i_sb->s_blocksize_bits - 9));
     return 0;
 }
 

@@ -60,6 +60,7 @@ struct fabriczc_block_group_desc {
 };
 
 #define FABRICZC_N_DIRECT_BLOCKS 12
+#define FABRICZC_INDIRECT_ENTRIES 1024 /* u32 pointers per 4 KiB index table */
 #define FABRICZC_FT_REG_FILE     1
 #define FABRICZC_FT_DIR          2
 
@@ -75,6 +76,9 @@ struct fabriczc_inode {
     u32 i_direct_blocks[FABRICZC_N_DIRECT_BLOCKS]; /* Map pointers to direct 4KB clusters */
     u32 i_indirect_block;     /* Map pointer targeting a secondary single-indirect index table */
     u32 i_checksum;           /* Individual item structure integrity verification signature */
+    u32 i_double_indirect_block; /* Map pointer to a double-indirect table. Lives in the
+                                  * struct's existing tail padding, so sizeof stays 96 and
+                                  * older images remain readable (a zero tail reads as unset). */
 };
 
 #define FABRICZC_NAME_LEN 255

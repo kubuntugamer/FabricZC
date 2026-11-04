@@ -10,6 +10,10 @@
 #include <linux/mpage.h>
 #include <linux/buffer_head.h>
 #include <linux/uio.h>
+#include <linux/pagemap.h>
+#include <linux/page-flags.h>
+#include <linux/xarray.h>
+#include <linux/writeback.h>
 #include <linux/vfs.h>
 #include <linux/blkdev.h>
 #include <fabriczc_internal.h>
@@ -19,6 +23,126 @@ MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Chazz");
 
 extern void fabriczc_evict_inode(struct inode *inode);
+
+/*
+ * Page cache support. This is the gate for running anything at all from
+ * FabricZC: execve() maps the ELF image and ld.so maps libc through
+ * file_operations->mmap, which the VFS refuses with -ENODEV when the file
+ * has no ->mmap hook or its mapping has no read_folio.
+ */
+static int fabriczc_read_folio(struct file *file, struct folio *folio)
+{
+    struct inode *inode = folio->mapping->host;
+    struct fabriczc_inode *raw = inode->i_private;
+    struct super_block *sb = inode->i_sb;
+    loff_t pos = folio_pos(folio);
+    size_t fsize = folio_size(folio);
+    size_t done;
+    char *buf;
+    int ret = 0;
+
+    if (!raw || !sb) { folio_unlock(folio); return -EIO; }
+
+    buf = kmalloc(4096, GFP_KERNEL);
+    if (!buf) { folio_unlock(folio); return -ENOMEM; }
+
+    for (done = 0; done < fsize; done += 4096) {
+        loff_t p = pos + done;
+        size_t n = min_t(size_t, fsize - done, 4096);
+
+        memset(buf, 0, 4096);
+        if (p < raw->i_size_bytes) {
+            u32 phys;
+            ret = fabriczc_bmap_block(inode, (u32)(p >> 12), &phys, false);
+            if (ret) goto out;
+            if (phys != FABRICZC_BLOCK_FREE) {
+                ret = fabriczc_read_block(sb, phys, buf, 4096);
+                if (ret) goto out;
+            }
+        }
+        memcpy(folio_address(folio) + done, buf, n);
+    }
+    folio_mark_uptodate(folio);
+out:
+    kfree(buf);
+    folio_unlock(folio);
+    return ret;
+}
+
+/*
+ * Writeback for pages dirtied through mmap(MAP_SHARED).
+ *
+ * The buffer_head/mpage machinery is deliberately avoided: it maps pages
+ * through fabriczc_get_block() and surfaced -EIO on the first msync(). Here the
+ * dirty folio is written with the same fabriczc_bmap_block()/fabriczc_write_block()
+ * pair the read and write paths use, so a shared store lands exactly where
+ * fabriczc_read_folio() will look for it.
+ */
+static int fabriczc_writepages(struct address_space *mapping,
+                               struct writeback_control *wbc)
+{
+    struct folio *folio;
+    pgoff_t index = 0;
+    int ret = 0;
+
+    xa_for_each(&mapping->i_pages, index, folio) {
+        struct inode *inode;
+        struct fabriczc_inode *raw;
+        loff_t pos;
+        size_t fsize, done;
+        char *buf;
+
+        if (wbc->nr_to_write <= 0) break;
+        if (!folio_trylock(folio)) continue;
+        if (folio->mapping != mapping || !folio_test_dirty(folio)) {
+            folio_unlock(folio);
+            continue;
+        }
+        inode = mapping->host;
+        raw = inode ? inode->i_private : NULL;
+        if (!raw || !folio_clear_dirty_for_io(folio)) {
+            folio_unlock(folio);
+            continue;
+        }
+        pos = folio_pos(folio);
+        fsize = folio_size(folio);
+        folio_start_writeback(folio);
+        folio_unlock(folio);
+
+        buf = kmalloc(4096, GFP_NOFS);
+        if (!buf) { folio_end_writeback(folio); ret = -ENOMEM; break; }
+        for (done = 0; done < fsize; done += 4096) {
+            loff_t p = pos + done;
+            size_t n = min_t(size_t, fsize - done, 4096);
+            u32 phys;
+
+            if (p >= raw->i_size_bytes) break; /* nothing past EOF to persist */
+            ret = fabriczc_bmap_block(inode, (u32)(p >> 12), &phys, true);
+            if (ret) break;
+            memcpy(buf, folio_address(folio) + done, n);
+            if (n < 4096) memset(buf + n, 0, 4096 - n);
+            ret = fabriczc_write_block(inode->i_sb, phys, buf, 4096);
+            if (ret) break;
+        }
+        kfree(buf);
+        folio_end_writeback(folio);
+        if (ret) { mapping_set_error(mapping, ret); break; }
+        wbc->nr_to_write -= fsize >> PAGE_SHIFT;
+    }
+    return ret;
+}
+
+static const struct address_space_operations fabriczc_aops = {
+    .read_folio  = fabriczc_read_folio,
+    .writepages  = fabriczc_writepages,
+    .dirty_folio = filemap_dirty_folio,
+};
+
+static void fabriczc_attach_aops(struct inode *inode)
+{
+    if (inode && inode->i_mapping)
+        inode->i_mapping->a_ops = &fabriczc_aops;
+}
 
 static void fabriczc_free_link_buf(void *p) { kfree(p); }
 
@@ -200,6 +324,7 @@ static struct inode *fabriczc_inode_from_raw(struct super_block *sb, u32 ino,
     struct inode *inode;
 
     inode = iget_locked(sb, ino);
+    fabriczc_attach_aops(inode);
     if (!inode) return ERR_PTR(-ENOMEM);
     if (inode_state_read_once(inode) & I_NEW) {
         inode->i_mode = raw->i_mode;
@@ -279,7 +404,7 @@ static ssize_t fabriczc_write_iter(struct kiocb *iocb, struct iov_iter *from)
     struct inode *inode = file_inode(iocb->ki_filp);
     struct fabriczc_inode *raw = inode->i_private;
     char *buf;
-    loff_t pos = iocb->ki_pos;
+    loff_t pos = iocb->ki_pos, start = iocb->ki_pos;
     size_t count = iov_iter_count(from);
     ssize_t written = 0;
     int ret = 0;
@@ -316,6 +441,16 @@ static ssize_t fabriczc_write_iter(struct kiocb *iocb, struct iov_iter *from)
         if (pos > raw->i_size_bytes)
             raw->i_size_bytes = pos;
         raw->i_blocks_allocated += 0; /* bmap already counts */
+        /* Reflect the new size back into the VFS inode so stat()/md5sum see it */
+        inode->i_size = raw->i_size_bytes;
+        inode->i_blocks = raw->i_blocks_allocated;
+        inode_set_ctime_current(inode);
+        inode->i_mtime_sec = inode->i_ctime_sec;
+        inode->i_mtime_nsec = inode->i_ctime_nsec;
+        /* Drop cached pages so mmap()/execve() readers never see stale data */
+        if (inode->i_mapping && pos > start)
+            invalidate_inode_pages2_range(inode->i_mapping, start >> PAGE_SHIFT,
+                                          (pos - 1) >> PAGE_SHIFT);
         fabriczc_inode_slot_write(inode->i_sb, inode->i_ino, raw);
         mark_inode_dirty(inode);
     }
@@ -405,6 +540,7 @@ static int fabriczc_unlink(struct inode *dir, struct dentry *dentry)
             raw->i_size_bytes = 0;
             raw->i_blocks_allocated = 0;
             raw->i_indirect_block = FABRICZC_BLOCK_FREE;
+            raw->i_double_indirect_block = FABRICZC_BLOCK_FREE;
             fabriczc_inode_slot_write(dir->i_sb, ino, raw);
         }
         kfree(raw);
@@ -413,7 +549,7 @@ static int fabriczc_unlink(struct inode *dir, struct dentry *dentry)
 }
 
 static int fabriczc_create(struct mnt_idmap *idmap, struct inode *dir,
-                           struct dentry *dentry, umode_t mode, bool excl)
+                           struct dentry *dentry, umode_t mode)
 {
     struct super_block *sb = dir->i_sb;
     struct fabriczc_inode *raw;
@@ -432,11 +568,13 @@ static int fabriczc_create(struct mnt_idmap *idmap, struct inode *dir,
     raw->i_blocks_allocated = 0;
     raw->i_generation = 0;
     raw->i_indirect_block = FABRICZC_BLOCK_FREE;
+    raw->i_double_indirect_block = FABRICZC_BLOCK_FREE;
     memset(raw->i_direct_blocks, 0xFF, sizeof(raw->i_direct_blocks));
     ret = fabriczc_inode_slot_write(sb, ino, raw);
     if (ret) { kfree(raw); goto err_slot; }
 
     inode = iget_locked(sb, ino);
+    fabriczc_attach_aops(inode);
     if (!inode) { kfree(raw); ret = -ENOMEM; goto err_slot; }
     if (inode_state_read_once(inode) & I_NEW) {
         inode_init_owner(idmap, inode, dir, mode);
@@ -490,12 +628,14 @@ static struct dentry *fabriczc_mkdir(struct mnt_idmap *idmap, struct inode *dir,
     raw->i_blocks_allocated = 8;
     raw->i_generation = 0;
     raw->i_indirect_block = FABRICZC_BLOCK_FREE;
+    raw->i_double_indirect_block = FABRICZC_BLOCK_FREE;
     memset(raw->i_direct_blocks, 0xFF, sizeof(raw->i_direct_blocks));
     raw->i_direct_blocks[0] = dblk;
     ret = fabriczc_inode_slot_write(sb, ino, raw);
     if (ret) { kfree(raw); goto err_blk; }
 
     inode = iget_locked(sb, ino);
+    fabriczc_attach_aops(inode);
     if (!inode) { kfree(raw); ret = -ENOMEM; goto err_blk; }
     if (inode_state_read_once(inode) & I_NEW) {
         inode_init_owner(idmap, inode, dir, mode);
@@ -514,7 +654,7 @@ static struct dentry *fabriczc_mkdir(struct mnt_idmap *idmap, struct inode *dir,
     ret = fabriczc_dir_add_entry(dir, dentry->d_name.name, ino, DT_DIR);
     if (ret) { iput(inode); kfree(raw); goto err_blk; }
     d_instantiate(dentry, inode);
-    return dentry;
+    return NULL; /* must not return the dentry: dcache contract for non-dcache fs */
 err_blk:
     fabriczc_free_data_block(sb, dblk);
 err_slot:
@@ -544,6 +684,7 @@ static int fabriczc_symlink(struct mnt_idmap *idmap, struct inode *dir,
     raw->i_blocks_allocated = 8;
     raw->i_generation = 0;
     raw->i_indirect_block = FABRICZC_BLOCK_FREE;
+    raw->i_double_indirect_block = FABRICZC_BLOCK_FREE;
     memset(raw->i_direct_blocks, 0xFF, sizeof(raw->i_direct_blocks));
     raw->i_direct_blocks[0] = dblk;
     fabriczc_write_block(sb, dblk, symname, (u32)min(len, (u64)4096));
@@ -551,6 +692,7 @@ static int fabriczc_symlink(struct mnt_idmap *idmap, struct inode *dir,
     if (ret) { kfree(raw); goto err_blk; }
 
     inode = iget_locked(sb, ino);
+    fabriczc_attach_aops(inode);
     if (!inode) { kfree(raw); ret = -ENOMEM; goto err_blk; }
     if (inode_state_read_once(inode) & I_NEW) {
         inode->i_mode = S_IFLNK | 0777;
@@ -594,11 +736,13 @@ static int fabriczc_mknod(struct mnt_idmap *idmap, struct inode *dir,
     raw->i_blocks_allocated = 0;
     raw->i_generation = 0;
     raw->i_indirect_block = FABRICZC_BLOCK_FREE;
+    raw->i_double_indirect_block = FABRICZC_BLOCK_FREE;
     memset(raw->i_direct_blocks, 0xFF, sizeof(raw->i_direct_blocks));
     ret = fabriczc_inode_slot_write(sb, ino, raw);
     if (ret) { kfree(raw); goto err_slot; }
 
     inode = iget_locked(sb, ino);
+    fabriczc_attach_aops(inode);
     if (!inode) { kfree(raw); ret = -ENOMEM; goto err_slot; }
     if (inode_state_read_once(inode) & I_NEW) {
         inode->i_mode = mode;
@@ -633,6 +777,13 @@ static int fabriczc_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
     struct fabriczc_inode *raw = inode->i_private;
     int error = setattr_prepare(idmap, dentry, attr);
     if (error) return error;
+    /*
+     * setattr_copy() applies mode/owner/times but never ATTR_SIZE:
+     * simple_setattr() covers size with truncate_setsize(), so without this
+     * ftruncate() returned success while the file size never changed.
+     */
+    if (attr->ia_valid & ATTR_SIZE)
+        truncate_setsize(inode, attr->ia_size);
     setattr_copy(idmap, inode, attr);
     if (raw) {
         raw->i_size_bytes = inode->i_size;
@@ -711,10 +862,27 @@ static const struct inode_operations fabriczc_dir_inode_operations = {
     .setattr        = fabriczc_setattr,
 };
 
+/*
+ * msync(MS_SYNC) is routed through ->fsync. Without this hook the syscall
+ * fails with -EINVAL and a caller cannot tell a successful flush from a
+ * lost one, so shared mapped stores would be unverifiable to userspace.
+ */
+static int fabriczc_fsync(struct file *file, loff_t start, loff_t end, int datasync)
+{
+    struct inode *inode = file_inode(file);
+    int ret;
+
+    ret = filemap_write_and_wait_range(inode->i_mapping, start, end);
+    if (ret) return ret;
+    return sync_blockdev(inode->i_sb->s_bdev);
+}
+
 static const struct file_operations fabriczc_file_operations = {
     .llseek         = generic_file_llseek,
     .read_iter      = fabriczc_read_iter,
     .write_iter     = fabriczc_write_iter,
+    .mmap           = generic_file_mmap,
+    .fsync          = fabriczc_fsync,
 };
 
 static const struct inode_operations fabriczc_file_inode_operations = {
@@ -756,6 +924,7 @@ static int fabriczc_fill_super(struct super_block *sb, struct fs_context *fc)
     if (ret) { kfree(raw_root); return ret; }
 
     root = iget_locked(sb, 1);
+    fabriczc_attach_aops(root);
     if (!root) { kfree(raw_root); return -ENOMEM; }
     if (inode_state_read_once(root) & I_NEW) {
         root->i_mode = S_IFDIR | 0755;

@@ -74,6 +74,9 @@ def pack_inode_root():
     struct.pack_into('<I', buf, 36 + 0*4, 0)
     struct.pack_into('<I', buf, 84, FABRICZC_BLOCK_FREE)    # i_indirect_block
     struct.pack_into('<I', buf, 88, 0)                       # i_checksum
+    # i_double_indirect_block occupies the struct's tail padding at 92;
+    # a zero there also reads as "unset" on images made by older mkfs builds.
+    struct.pack_into('<I', buf, 92, FABRICZC_BLOCK_FREE)     # i_double_indirect_block
     return buf
 
 def main():
