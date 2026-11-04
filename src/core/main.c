@@ -24,9 +24,15 @@ struct fabriczc_runtime_context core_ctx;
 static int fabriczc_major = 0;
 static dev_t host_os_dev = 0;
 
-static char *fabriczc_target = "/dev/rcraid0";
+/*
+ * Backing volume the filesystem layer reads and writes. This host presents its
+ * NVMe array through the HighPoint hptnvme driver as /dev/hptblock6n0p; the
+ * previous default ("rcraid0") was a leftover from the early stub and named an
+ * AMD driver that is not involved here. Override with target=/dev/<node>.
+ */
+static char *fabriczc_target = "/dev/hptblock6n0p";
 module_param_named(target, fabriczc_target, charp, 0444);
-MODULE_PARM_DESC(target, "Backing block device for the FabricZC layer");
+MODULE_PARM_DESC(target, "Backing block device (default: /dev/hptblock6n0p, the hptnvme array volume)");
 
 
 struct fabriczc_runtime_context *fabriczc_get_runtime_ctx(void)

@@ -47,19 +47,19 @@ while true; do
   echo "  ▸ Unreclaimable Slab : $(printf "%.2f" $slab_unrec) MB (VFS/Blob Structure Bloat)"
   echo "  ▸ Free Available RAM : $free_ram MB"
 
-  # 4. STORAGE DATA BUS LAYER (desktopECHO rcraid / dev/rcraid0 Array)
+  # 4. STORAGE DATA BUS LAYER (HighPoint hptnvme array volume)
   echo -e "\n\e[1;34m 16TB NVME STORAGE BUS ARRAY METRICS\e[0m"
-  if [ -b /dev/rcraid0 ]; then
-    io_status=$(cat /sys/block/rcraid0/stat)
+  if [ -b /dev/hptblock6n0p ]; then
+    io_status=$(cat /sys/block/hptblock6n0p/stat)
     read_sectors=$(echo $io_status | awk '{print $3}')
     write_sectors=$(echo $io_status | awk '{print $7}')
     read_mb=$(echo "scale=2; $read_sectors * 512 / 1024 / 1024" | bc)
     write_mb=$(echo "scale=2; $write_sectors * 512 / 1024 / 1024" | bc)
-    echo "  ▸ Active Target Node : /dev/rcraid0"
+    echo "  ▸ Active Target Node : /dev/hptblock6n0p (hptnvme)"
     echo "  ▸ Total Block Reads  : $read_mb MB"
     echo "  ▸ Total Block Writes : $write_mb MB"
   elif [ -b /dev/sda ]; then
-    echo "  ▸ Active Target Node : /dev/sda (AMD Blob SCSI Emulation Emitted)"
+    echo "  ▸ Active Target Node : /dev/sda (fallback, hptnvme node missing)"
   else
     echo "  ▸ [No Hardware Array Detected: Standard /dev/nvme Paths Trapped]"
   fi

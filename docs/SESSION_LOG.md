@@ -221,3 +221,21 @@ session (or person) knows what changed, what was verified, and what is still ope
 - Not verified: punch-hole, `trusted.*`/`security.*` namespaces, xattrs on symlinks,
   xattr values larger than one block (`-E2BIG`), boot-time autoload, the real
   `/dev/rcraid0` array, clean-tree `make`.
+
+## 2026-11-04 18:00 — Backing device default corrected to the hptnvme node
+
+- `src/core/main.c` defaulted `target` to `/dev/rcraid0`. That name is an AMD
+  rcraid leftover from the early stub; the array on this machine is a HighPoint
+  NVMe volume presented by `hptnvme` as `/dev/hptblock6n0p` (14.55 TiB, no
+  partition table yet), and rcraid is not loaded.
+- Default is now `/dev/hptblock6n0p`, the module parameter help text names it,
+  `scripts/live_dashboard.sh` and the spec header point at the same node.
+- Verified: `make` rc 0 and `strings fabriczc_mod.ko | grep -i 'hptblock\|rcraid'`
+  returns only the new default. `insmod fabriczc_mod.ko` with no parameters
+  bound `[hptblock6n0p]` in dmesg, `/dev/fabriczc0` reported
+  16002779709440 bytes (14.55 TiB), and `rmmod` unloaded cleanly. No mount and no
+  writes to the array were performed.
+- Still in the tree but not built by the Makefile: `src/kernel/driver/main.c`, an
+  old standalone staging driver that registers a disk named `rcraid` and prints
+  a "40.8 GB storage array". It is where the rcraid naming came from; it was
+  left untouched rather than deleted.
