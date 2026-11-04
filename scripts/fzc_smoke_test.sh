@@ -38,7 +38,7 @@ step() { echo "==> $*"; }
 [ "$(id -u)" -eq 0 ] || die "must run as root (sudo $0)"
 [ -f "$KO" ] || die "$KO not found; build the module first (make)"
 [ -f "$MKFS" ] || die "$MKFS not found"
-for tool in losetup truncate python3 dmesg findmnt mountpoint cmp stat; do
+for tool in losetup truncate python3 dmesg findmnt mountpoint cmp stat fallocate; do
     command -v "$tool" >/dev/null || die "missing required tool: $tool"
 done
 mkdir -p "$IMG_DIR" || die "could not create $IMG_DIR"
@@ -111,6 +111,43 @@ cp "$SRC_DIR/large.bin" "$MNT/large.bin" || die "8 MiB copy failed"
 cmp -s "$SRC_DIR/large.bin" "$MNT/large.bin" || die "8 MiB content mismatch"
 pass "8 MiB file copy matches (indirect + double-indirect blocks)"
 
+step "testing extended attributes (user.* namespace)"
+if ! python3 - "$MNT/hello.txt" <<'PY'
+import errno, os, sys
+
+path = sys.argv[1]
+os.setxattr(path, "user.origin", b"smoke")
+if os.getxattr(path, "user.origin") != b"smoke":
+    sys.exit("getxattr returned the wrong value")
+if "user.origin" not in os.listxattr(path):
+    sys.exit("listxattr does not report user.origin")
+try:
+    os.setxattr(path, "security.probe", b"x")
+    sys.exit("an attribute in an unwired namespace was accepted")
+except OSError as e:
+    if e.errno != errno.EOPNOTSUPP:
+        sys.exit("security.* failed with %s, expected EOPNOTSUPP" % errno.errorcode.get(e.errno))
+PY
+then
+    die "user xattr set/get/list or namespace rejection failed"
+fi
+pass "user.* xattr stored, listed and readable; other namespaces refused"
+
+step "testing fallocate"
+fallocate -l 8M "$MNT/prealloc.bin" || die "fallocate reserve failed"
+[ "$(stat -c %s "$MNT/prealloc.bin")" = "8388608" ] || die "fallocate did not extend the file to 8 MiB"
+python3 - "$MNT/prealloc.bin" <<'PY'
+import sys
+
+with open(sys.argv[1], "rb") as f:
+    if any(f.read()):
+        sys.exit("preallocated range does not read back as zeros")
+PY
+printf 'abc' > "$MNT/keep.bin"
+fallocate -n -l 8M "$MNT/keep.bin" || die "fallocate -n failed"
+[ "$(stat -c %s "$MNT/keep.bin")" = "3" ] || die "fallocate -n changed the file size"
+pass "fallocate reserves zeroed blocks and -n keeps the size"
+
 step "testing mmap(MAP_SHARED) writeback"
 if ! python3 - "$MNT/mmap.bin" <<'PY'
 import mmap, os, sys
@@ -159,7 +196,13 @@ MOUNTED=1
 cmp -s "$SRC_DIR/small.bin" "$MNT/sub/blob.bin" || die "sub/blob.bin did not survive remount"
 cmp -s "$SRC_DIR/large.bin" "$MNT/large.bin" || die "large.bin did not survive remount"
 [ "$(md5sum "$MNT/mmap.bin" | cut -d' ' -f1)" = "$mmap_md5" ] || die "mmap.bin did not survive remount"
-pass "data (including the mmap-written page) survived unmount/remount"
+python3 - "$MNT/hello.txt" <<'PY' || die "user.origin did not survive remount"
+import os, sys
+
+if os.getxattr(sys.argv[1], "user.origin") != b"smoke":
+    sys.exit(1)
+PY
+pass "data (including the mmap-written page) and the xattr survived unmount/remount"
 
 step "checking kernel log for faults"
 faults="$(dmesg | tail -n +$((DMESG_MARK + 1)) | grep -iE 'WARNING:|BUG:|Oops|Call Trace' || true)"

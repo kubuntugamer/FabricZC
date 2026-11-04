@@ -686,6 +686,10 @@ void fabriczc_evict_inode(struct inode *inode)
             struct fabriczc_sb_info *sbi = sb ? (struct fabriczc_sb_info *)sb->s_fs_info : NULL;
 
             fabriczc_truncate_blocks(inode, 0);
+            if (raw->i_xattr_block) {
+                fabriczc_free_data_block(sb, raw->i_xattr_block);
+                raw->i_xattr_block = 0;
+            }
             memset(raw, 0, sizeof(*raw));
             fabriczc_inode_slot_write(sb, inode->i_ino, raw);
             if (sbi) sbi->free_inodes++;

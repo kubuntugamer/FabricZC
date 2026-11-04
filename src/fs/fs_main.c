@@ -17,6 +17,7 @@
 #include <linux/vfs.h>
 #include <linux/blkdev.h>
 #include <linux/user_namespace.h>
+#include <linux/falloc.h>
 #include <fabriczc_internal.h>
 #include <fabriczc_common.h>
 
@@ -155,6 +156,9 @@ static const struct inode_operations fabriczc_file_inode_operations;
 static const struct file_operations fabriczc_file_operations;
 
 static const struct inode_operations fabriczc_symlink_inode_operations;
+
+static ssize_t fabriczc_listxattr(struct dentry *dentry, char *buffer, size_t size);
+static const struct xattr_handler * const fabriczc_xattr_handlers[];
 
 static void fabriczc_persist_nlink(struct inode *inode);
 
@@ -1097,6 +1101,7 @@ static const struct inode_operations fabriczc_dir_inode_operations = {
     .mknod          = fabriczc_mknod,
     .rename         = fabriczc_rename,
     .setattr        = fabriczc_setattr,
+    .listxattr      = fabriczc_listxattr,
 };
 
 /*
@@ -1114,21 +1119,338 @@ static int fabriczc_fsync(struct file *file, loff_t start, loff_t end, int datas
     return sync_blockdev(inode->i_sb->s_bdev);
 }
 
+/*
+ * fallocate: reserve blocks inside the mapping without going through the page
+ * cache. The allocator does not scrub a block it hands out, so every block is
+ * written as zeros here; a preallocated range must read back as zeros rather
+ * than as the previous owner's data. FALLOC_FL_PUNCH_HOLE is refused instead
+ * of being emulated, because releasing the middle of the pointer tree is a
+ * different operation from the tail release truncate() does.
+ */
+static long fabriczc_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
+{
+    struct inode *inode = file_inode(file);
+    struct fabriczc_inode *raw = inode->i_private;
+    const int supported = FALLOC_FL_KEEP_SIZE | FALLOC_FL_ZERO_RANGE;
+    loff_t end;
+    char *zero;
+    u64 iblock, last;
+    int ret = 0;
+
+    if (!raw) return -EINVAL;
+    if (mode & FALLOC_FL_PUNCH_HOLE) return -EOPNOTSUPP;
+    if (mode & ~supported) return -EOPNOTSUPP;
+    if (offset < 0 || len <= 0) return -EINVAL;
+    if (offset > inode->i_sb->s_maxbytes ||
+        len > inode->i_sb->s_maxbytes - offset)
+        return -EFBIG;
+
+    end = offset + len;
+    zero = kzalloc(4096, GFP_KERNEL);
+    if (!zero) return -ENOMEM;
+
+    iblock = (u64)offset >> 12;
+    last = (u64)(end - 1) >> 12;
+    for (; iblock <= last; iblock++) {
+        u64 phys;
+
+        if (fatal_signal_pending(current)) { ret = -EINTR; break; }
+        ret = fabriczc_bmap_block(inode, iblock, &phys, true);
+        if (ret) break;
+        ret = fabriczc_write_block(inode->i_sb, phys, zero, 4096);
+        if (ret) break;
+    }
+    kfree(zero);
+    if (ret) return ret;
+
+    if (!(mode & FALLOC_FL_KEEP_SIZE) && end > raw->i_size_bytes)
+        raw->i_size_bytes = end;
+    inode->i_size = raw->i_size_bytes;
+    inode->i_blocks = raw->i_blocks_allocated;
+    inode_set_ctime_current(inode);
+    /* Drop cached pages of the range so mmap() readers do not keep stale data */
+    if (inode->i_mapping)
+        invalidate_inode_pages2_range(inode->i_mapping, offset >> PAGE_SHIFT,
+                                      (end - 1) >> PAGE_SHIFT);
+    return fabriczc_inode_slot_write(inode->i_sb, inode->i_ino, raw);
+}
+
 static const struct file_operations fabriczc_file_operations = {
     .llseek         = generic_file_llseek,
     .read_iter      = fabriczc_read_iter,
     .write_iter     = fabriczc_write_iter,
     .mmap           = generic_file_mmap,
     .fsync          = fabriczc_fsync,
+    .fallocate      = fabriczc_fallocate,
+};
+
+/*
+ * Extended attributes: the user.* namespace only, in one 4 KiB side block whose
+ * block number lives in struct fabriczc_inode. Records are laid out back to
+ * back as { u16 name_len; u16 value_len; name; value; pad to 4 }. Images made
+ * before i_xattr_block existed have a zero-filled tail there, which reads as
+ * "no xattr block", so no format version bump is needed.
+ */
+#define FABRICZC_XATTR_MAGIC   0x5834525Au   /* "X4RZ" */
+#define FABRICZC_XATTR_REC     4u
+#define FABRICZC_XATTR_BLOCK   4096u
+#define FABRICZC_XATTR_NAME_MAX 255u
+
+struct fabriczc_xattr_header {
+    u32 magic;
+    u16 used;      /* record bytes in use after this header */
+    u16 count;     /* live attributes */
+    u8  reserved[8];
+};
+
+struct fabriczc_xattr_record {
+    u16 name_len;
+    u16 value_len;
+};
+
+#define FABRICZC_XATTR_ALIGN(n) (((n) + 3u) & ~3u)
+
+/* Load the xattr block, or NULL when the inode has none. */
+static char *fabriczc_xattr_read(struct inode *inode)
+{
+    struct fabriczc_inode *raw = inode->i_private;
+    struct fabriczc_xattr_header *hdr;
+    char *buf;
+
+    if (!raw || !raw->i_xattr_block) return NULL;
+    buf = kmalloc(FABRICZC_XATTR_BLOCK, GFP_KERNEL);
+    if (!buf) return ERR_PTR(-ENOMEM);
+    if (fabriczc_read_block(inode->i_sb, raw->i_xattr_block, buf,
+                            FABRICZC_XATTR_BLOCK)) {
+        kfree(buf);
+        return ERR_PTR(-EIO);
+    }
+    hdr = (struct fabriczc_xattr_header *)buf;
+    if (hdr->magic != FABRICZC_XATTR_MAGIC) {
+        kfree(buf);
+        return ERR_PTR(-EIO);
+    }
+    return buf;
+}
+
+/*
+ * Step over the records: 1 = returned one, 0 = end of block, negative = the
+ * block is inconsistent (bad lengths or a used count past the end).
+ */
+static int fabriczc_xattr_iter(char *buf, size_t *off,
+                               struct fabriczc_xattr_record **rec,
+                               char **name)
+{
+    struct fabriczc_xattr_header *hdr = (struct fabriczc_xattr_header *)buf;
+    size_t end = sizeof(*hdr) + hdr->used;
+    size_t total;
+
+    if (end > FABRICZC_XATTR_BLOCK) return -EIO;
+    if (*off + FABRICZC_XATTR_REC > end) return 0;
+
+    *rec = (struct fabriczc_xattr_record *)(buf + *off);
+    *name = buf + *off + FABRICZC_XATTR_REC;
+    total = FABRICZC_XATTR_REC + (*rec)->name_len + (*rec)->value_len;
+    if (*off + total > end) return -EIO;
+    *off += FABRICZC_XATTR_ALIGN(total);
+    return 1;
+}
+
+static int fabriczc_user_xattr_get(const struct xattr_handler *handler,
+                                   struct dentry *dentry, struct inode *inode,
+                                   const char *name, void *buffer, size_t size)
+{
+    struct fabriczc_xattr_record *rec;
+    size_t off = sizeof(struct fabriczc_xattr_header);
+    size_t namelen = strlen(name);
+    char *buf, *rec_name;
+    int iter, ret = -ENODATA;
+
+    buf = fabriczc_xattr_read(inode);
+    if (IS_ERR(buf)) return PTR_ERR(buf);
+    if (!buf) return -ENODATA;
+
+    while ((iter = fabriczc_xattr_iter(buf, &off, &rec, &rec_name)) == 1) {
+        if (rec->name_len != namelen || memcmp(rec_name, name, namelen)) continue;
+        if (size == 0) {
+            ret = rec->value_len;
+        } else if (size < rec->value_len) {
+            ret = -ERANGE;
+        } else {
+            memcpy(buffer, rec_name + rec->name_len, rec->value_len);
+            ret = rec->value_len;
+        }
+        break;
+    }
+    if (iter < 0) ret = iter;
+    kfree(buf);
+    return ret;
+}
+
+static int fabriczc_user_xattr_set(const struct xattr_handler *handler,
+                                   struct mnt_idmap *idmap,
+                                   struct dentry *dentry, struct inode *inode,
+                                   const char *name, const void *value,
+                                   size_t size, int flags)
+{
+    struct fabriczc_inode *raw = inode->i_private;
+    struct fabriczc_xattr_header *hdr;
+    struct fabriczc_xattr_record *rec;
+    size_t namelen, off, dst;
+    char *old = NULL, *new = NULL, *rec_name;
+    bool exists = false;
+    int iter, ret = 0;
+
+    if (!raw) return -EINVAL;
+    namelen = strlen(name);
+    if (namelen == 0 || namelen > FABRICZC_XATTR_NAME_MAX) return -ERANGE;
+    if (flags & ~(XATTR_CREATE | XATTR_REPLACE)) return -EOPNOTSUPP;
+    if (flags == (XATTR_CREATE | XATTR_REPLACE)) return -EINVAL;
+    if (value && size > FABRICZC_XATTR_BLOCK) return -E2BIG;
+
+    old = fabriczc_xattr_read(inode);
+    if (IS_ERR(old)) return PTR_ERR(old);
+
+    if (old) {
+        off = sizeof(*hdr);
+        while ((iter = fabriczc_xattr_iter(old, &off, &rec, &rec_name)) == 1) {
+            if (rec->name_len == namelen && !memcmp(rec_name, name, namelen)) {
+                exists = true;
+                break;
+            }
+        }
+        if (iter < 0) { kfree(old); return iter; }
+    }
+
+    if (value && (flags & XATTR_CREATE) && exists) { kfree(old); return -EEXIST; }
+    if ((flags & XATTR_REPLACE) && !exists) { kfree(old); return -ENODATA; }
+    if (!value && !exists) { kfree(old); return -ENODATA; }   /* removexattr */
+
+    /* Rebuild the block: copy every other record, then the new value. */
+    new = kzalloc(FABRICZC_XATTR_BLOCK, GFP_KERNEL);
+    if (!new) { kfree(old); return -ENOMEM; }
+    hdr = (struct fabriczc_xattr_header *)new;
+    hdr->magic = FABRICZC_XATTR_MAGIC;
+    dst = sizeof(*hdr);
+
+    if (old) {
+        off = sizeof(*hdr);
+        while ((iter = fabriczc_xattr_iter(old, &off, &rec, &rec_name)) == 1) {
+            size_t rlen = FABRICZC_XATTR_ALIGN(FABRICZC_XATTR_REC +
+                                               rec->name_len + rec->value_len);
+
+            if (rec->name_len == namelen && !memcmp(rec_name, name, namelen))
+                continue;
+            if (dst + rlen > FABRICZC_XATTR_BLOCK) { ret = -E2BIG; goto out; }
+            memcpy(new + dst, rec, FABRICZC_XATTR_REC + rec->name_len + rec->value_len);
+            dst += rlen;
+            hdr->count++;
+        }
+        if (iter < 0) { ret = iter; goto out; }
+    }
+
+    if (value) {
+        size_t rlen = FABRICZC_XATTR_ALIGN(FABRICZC_XATTR_REC + namelen + size);
+
+        if (dst + rlen > FABRICZC_XATTR_BLOCK) { ret = -E2BIG; goto out; }
+        rec = (struct fabriczc_xattr_record *)(new + dst);
+        rec->name_len = (u16)namelen;
+        rec->value_len = (u16)size;
+        memcpy(new + dst + FABRICZC_XATTR_REC, name, namelen);
+        memcpy(new + dst + FABRICZC_XATTR_REC + namelen, value, size);
+        dst += rlen;
+        hdr->count++;
+    }
+    hdr->used = (u16)(dst - sizeof(*hdr));
+
+    if (!hdr->count) {
+        /* Last attribute removed: give the block back. */
+        if (raw->i_xattr_block) {
+            fabriczc_free_data_block(inode->i_sb, raw->i_xattr_block);
+            raw->i_xattr_block = 0;
+            if (raw->i_blocks_allocated >= 8)
+                raw->i_blocks_allocated -= 8;
+            inode->i_blocks = raw->i_blocks_allocated;
+            ret = fabriczc_inode_slot_write(inode->i_sb, inode->i_ino, raw);
+        }
+        goto out;
+    }
+
+    if (!raw->i_xattr_block) {
+        u64 blk;
+
+        ret = fabriczc_alloc_data_block(inode->i_sb, &blk);
+        if (ret) goto out;
+        raw->i_xattr_block = blk;
+        raw->i_blocks_allocated += 8;
+        inode->i_blocks = raw->i_blocks_allocated;
+    }
+    ret = fabriczc_write_block(inode->i_sb, raw->i_xattr_block, new,
+                               FABRICZC_XATTR_BLOCK);
+    if (!ret) {
+        inode_set_ctime_current(inode);
+        ret = fabriczc_inode_slot_write(inode->i_sb, inode->i_ino, raw);
+    }
+out:
+    kfree(new);
+    kfree(old);
+    return ret;
+}
+
+static ssize_t fabriczc_listxattr(struct dentry *dentry, char *buffer, size_t size)
+{
+    struct inode *inode = d_inode(dentry);
+    struct fabriczc_xattr_record *rec;
+    size_t off = sizeof(struct fabriczc_xattr_header);
+    ssize_t used = 0;
+    char *buf, *rec_name;
+    int iter;
+
+    buf = fabriczc_xattr_read(inode);
+    if (IS_ERR(buf)) return PTR_ERR(buf);
+    if (!buf) return 0;
+
+    /*
+     * The VFS hands the handlers names without the namespace prefix, so the
+     * records hold bare names. listxattr() must give userspace the full name,
+     * otherwise getfattr -n reports "user.x" and reads back -ENODATA.
+     */
+    while ((iter = fabriczc_xattr_iter(buf, &off, &rec, &rec_name)) == 1) {
+        size_t plen = XATTR_USER_PREFIX_LEN;
+
+        if (buffer) {
+            if (used + plen + rec->name_len + 1 > size) { used = -ERANGE; break; }
+            memcpy(buffer + used, XATTR_USER_PREFIX, plen);
+            memcpy(buffer + used + plen, rec_name, rec->name_len);
+            buffer[used + plen + rec->name_len] = '\0';
+        }
+        used += plen + rec->name_len + 1;
+    }
+    if (iter < 0) used = iter;
+    kfree(buf);
+    return used;
+}
+
+static const struct xattr_handler fabriczc_user_xattr_handler = {
+    .prefix = XATTR_USER_PREFIX,
+    .get    = fabriczc_user_xattr_get,
+    .set    = fabriczc_user_xattr_set,
+};
+
+static const struct xattr_handler * const fabriczc_xattr_handlers[] = {
+    &fabriczc_user_xattr_handler,
+    NULL,
 };
 
 static const struct inode_operations fabriczc_file_inode_operations = {
     .setattr        = fabriczc_setattr,
+    .listxattr      = fabriczc_listxattr,
 };
 
 static const struct inode_operations fabriczc_symlink_inode_operations = {
     .get_link       = fabriczc_get_link,
     .setattr        = fabriczc_setattr,
+    .listxattr      = fabriczc_listxattr,
 };
 
 static int fabriczc_fill_super(struct super_block *sb, struct fs_context *fc)
@@ -1145,6 +1467,7 @@ static int fabriczc_fill_super(struct super_block *sb, struct fs_context *fc)
     sb->s_blocksize_bits = 12;
     sb->s_magic = FABRICZC_SB_MAGIC;
     sb->s_op = &fabriczc_super_ops;
+    sb->s_xattr = fabriczc_xattr_handlers;
 
     sb_buf = kmalloc(4096, GFP_KERNEL);
     if (!sb_buf) return -ENOMEM;

@@ -184,3 +184,40 @@ session (or person) knows what changed, what was verified, and what is still ope
   the parent commit does.
 - Not verified this session: boot-time autoload, the real `/dev/rcraid0` array, a
   clean-tree `make`, and xattrs/`fallocate` from #44 — all still open.
+
+## 2026-11-04 17:40 — user xattrs and fallocate (#44)
+
+- HEAD: the commit carrying this entry (parent `45ccfcf`); kernel `7.3.0-10-generic`.
+- Throughput question from the 17:05 entry is answered: rerunning the same scale
+  test gave **112 MiB/s**, and a raw 1 GiB write to the host disk gives 101–111
+  MB/s, so the filesystem is at the disk ceiling. A zero-fill probe at 4k/64k/1M/4M
+  blocks gave 121/149/141/134 MiB/s, which rules out the per-4 KiB
+  `kernel_write()` loop as the bottleneck. The 39 MiB/s reading was environmental
+  (host page cache state right after the crash), not a regression.
+- Extended attributes: `struct fabriczc_inode` gains `i_xattr_block` carved out of
+  the reserved tail (88 → 80 bytes, offset 168). Old images read 0 there, which
+  means "no attributes", so **no format version bump and no mkfs change**.
+  `src/fs/fs_main.c` adds a `user.*` handler pair plus `listxattr`, `src/fs/metadata_io.c`
+  frees the side block in `evict_inode()` when the last link goes away.
+  Block layout: `{ u32 magic "X4RZ"; u16 used; u16 count }` followed by
+  `{ u16 name_len; u16 value_len; name; value }` records, 4-byte aligned, whole
+  namespace bounded by one 4 KiB block. The VFS hands handlers names with the
+  `user.` prefix stripped, so records hold bare names and `listxattr` re-adds the
+  prefix — without that `listxattr` returned `origin` and `getfattr -n user.origin`
+  could not find it.
+- `fallocate`: plain, `FALLOC_FL_KEEP_SIZE` and `FALLOC_FL_ZERO_RANGE` are
+  supported; every block is written as zeros because `fabriczc_alloc_data_block()`
+  does not scrub a reused block. `FALLOC_FL_PUNCH_HOLE` returns `-EOPNOTSUPP`
+  rather than being emulated: releasing the middle of the pointer tree is not the
+  tail release `truncate` does.
+- Verified: `sudo scripts/fzc_smoke_test.sh` → **11/11 checks passed**, rc 0 (the
+  two new checks are the xattr round-trip, namespace rejection and remount
+  persistence, and fallocate reserve/zero/`-n` keep-size). A separate probe on a
+  4 GiB image confirmed `setxattr`/`getxattr`/`listxattr`/`removexattr`, `XATTR_CREATE`
+  → `EEXIST`, `XATTR_REPLACE` on a missing name → `ENODATA`, `security.*` →
+  `EOPNOTSUPP`, 5 files × (data block + xattr block) returned the free-block count
+  exactly to baseline after unlink, and a 1 MiB `0xFF` range zeroed by `fallocate -z`
+  read back as zeros with the size unchanged.
+- Not verified: punch-hole, `trusted.*`/`security.*` namespaces, xattrs on symlinks,
+  xattr values larger than one block (`-E2BIG`), boot-time autoload, the real
+  `/dev/rcraid0` array, clean-tree `make`.

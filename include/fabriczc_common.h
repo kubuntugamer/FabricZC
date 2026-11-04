@@ -86,7 +86,8 @@ struct fabriczc_inode {
     u64 i_double_indirect_block; /* Level 2 index table */
     u64 i_triple_indirect_block; /* Level 3 index table */
     u64 i_quad_indirect_block;   /* Level 4 index table */
-    u8  i_reserved[88];       /* Pad to 256 bytes */
+    u64 i_xattr_block;        /* Data block holding user.* attributes, 0 = none */
+    u8  i_reserved[80];       /* Pad to 256 bytes */
 };
 
 #define FABRICZC_NAME_LEN 255
