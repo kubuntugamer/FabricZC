@@ -43,55 +43,6 @@ int fabriczc_flush_metadata_block(u64 block_index, void *buffer_data)
     return fabriczc_submit_raw_bio(bio);
 }
 
-int fabriczc_add_directory_entry(struct buffer_head *bh, const char *name, u32 target_inode, u8 file_type)
-{
-    struct fabriczc_dir_entry *de, *next_de;
-    unsigned int offset = 0, name_len = strlen(name);
-    unsigned int rec_len = ((sizeof(struct fabriczc_dir_entry) + name_len + 7) & ~7);
-    
-    if (unlikely(!bh || !name)) return -EINVAL;
-    if (name_len > FABRICZC_NAME_LEN) return -ENAMETOOLONG;
-
-    while (offset < 4096) {
-        de = (struct fabriczc_dir_entry *)((char *)bh->b_data + offset);
-        
-        if (de->record_length_bytes == 0) {
-            de->inode_number = target_inode;
-            de->record_length_bytes = 4096 - offset;
-            de->name_length = name_len;
-            de->file_type = file_type;
-            memcpy(de->file_name, name, name_len);
-            
-            /* FORCE CACHE FLUSH TO HARDWARE SECTORS IMMEDIATELY */
-            mark_buffer_dirty(bh);
-            sync_dirty_buffer(bh);
-            return 0;
-        }
-        
-        unsigned int actual_used_len = ((sizeof(struct fabriczc_dir_entry) + de->name_length + 7) & ~7);
-        if (de->inode_number != 0 && (de->record_length_bytes - actual_used_len) >= rec_len) {
-            unsigned int left_over = de->record_length_bytes - actual_used_len;
-            de->record_length_bytes = actual_used_len;
-            
-            offset += actual_used_len;
-            next_de = (struct fabriczc_dir_entry *)((char *)bh->b_data + offset);
-            next_de->inode_number = target_inode;
-            next_de->record_length_bytes = left_over;
-            next_de->name_length = name_len;
-            next_de->file_type = file_type;
-            memcpy(next_de->file_name, name, name_len);
-            
-            /* FORCE CACHE FLUSH TO HARDWARE SECTORS IMMEDIATELY */
-            mark_buffer_dirty(bh);
-            sync_dirty_buffer(bh);
-            return 0;
-        }
-        
-        offset += de->record_length_bytes;
-    }
-    return -ENOSPC;
-}
-
 int fabriczc_mount_journal(struct super_block *sb, u64 journal_block)
 {
     struct buffer_head *bh;
@@ -244,47 +195,226 @@ static int fabriczc_bitmap_test_set(struct super_block *sb, u64 blk, bool set)
     return 0;
 }
 
-int fabriczc_alloc_data_block(struct super_block *sb, u64 *out_blk)
+/*
+ * Scan [from, to) of the allocation bitmap and claim the first free bit.
+ * The caller holds sbi->alloc_mutex across the test-and-set, so two writers
+ * cannot be handed the same block.
+ */
+static int fabriczc_claim_bitmap_range(struct super_block *sb, u64 from, u64 to,
+                                       u64 *out_blk)
 {
     u64 total = fabriczc_sb_total_blocks(sb);
-    u64 first = fabriczc_data_start(total);
-    u64 bmp_blocks = fabriczc_bitmap_block_count(total);
-    u64 g;
+    u64 cur = from;
 
-    if (unlikely(!out_blk)) return -EINVAL;
-    for (g = 0; g < bmp_blocks; g++) {
+    if (to > total) to = total;
+    while (cur < to) {
+        u64 group = cur / FABRICZC_BITS_PER_BLOCK;
+        u64 group_base = group * FABRICZC_BITS_PER_BLOCK;
+        u32 bit = (u32)(cur - group_base);
         struct buffer_head *bh;
-        u64 bitmap_block = FABRICZC_BITMAP_START + g;
-        u64 group_base = g * FABRICZC_BITS_PER_BLOCK;
-        u64 scan = (group_base < first) ? (first - group_base) : 0;
-        u32 bit;
 
-        bh = sb_bread(sb, bitmap_block);
+        bh = sb_bread(sb, FABRICZC_BITMAP_START + group);
         if (!bh) return -EIO;
-        for (bit = (u32)scan; bit < FABRICZC_BITS_PER_BLOCK; bit++) {
-            if (group_base + bit >= total) break;
+        for (; bit < FABRICZC_BITS_PER_BLOCK; bit++) {
+            if (group_base + bit >= to) break;
             if (!test_bit(bit, (unsigned long *)bh->b_data)) {
                 set_bit(bit, (unsigned long *)bh->b_data);
                 mark_buffer_dirty(bh);
                 sync_dirty_buffer(bh);
-                brelse(bh);
-                fabriczc_free_blocks_add(sb, -1);
                 *out_blk = group_base + bit;
+                brelse(bh);
                 return 0;
             }
         }
         brelse(bh);
+        cur = group_base + FABRICZC_BITS_PER_BLOCK;
     }
     return -ENOSPC;
 }
 
+/*
+ * Allocation starts at a moving cursor instead of at the first data block.
+ * Restarting at block 0 on every call made a sequential fill O(n^2) in bitmap
+ * scans: a 1 GiB write spent most of its time re-reading the same early bitmap
+ * blocks, and throughput fell as the volume filled.
+ */
+int fabriczc_alloc_data_block(struct super_block *sb, u64 *out_blk)
+{
+    struct fabriczc_sb_info *sbi = sb ? (struct fabriczc_sb_info *)sb->s_fs_info : NULL;
+    u64 total, first, start;
+    int ret;
+
+    if (unlikely(!out_blk || !sbi)) return -EINVAL;
+
+    total = fabriczc_sb_total_blocks(sb);
+    first = fabriczc_data_start(total);
+    if (first >= total) return -ENOSPC;
+
+    mutex_lock(&sbi->alloc_mutex);
+    start = sbi->alloc_hint;
+    if (start < first || start >= total) start = first;
+
+    ret = fabriczc_claim_bitmap_range(sb, start, total, out_blk);
+    if (ret == -ENOSPC && start > first)
+        ret = fabriczc_claim_bitmap_range(sb, first, start, out_blk);
+    if (!ret) {
+        sbi->alloc_hint = *out_blk + 1;
+        fabriczc_free_blocks_add(sb, -1);
+    }
+    mutex_unlock(&sbi->alloc_mutex);
+    return ret;
+}
+
 int fabriczc_free_data_block(struct super_block *sb, u64 blk)
 {
-    int ret = fabriczc_bitmap_test_set(sb, blk, false);
+    struct fabriczc_sb_info *sbi = sb ? (struct fabriczc_sb_info *)sb->s_fs_info : NULL;
+    int ret;
 
-    if (!ret)
+    if (unlikely(!sbi)) return -EINVAL;
+    if (blk < fabriczc_data_start(fabriczc_sb_total_blocks(sb))) return -EINVAL;
+
+    mutex_lock(&sbi->alloc_mutex);
+    ret = fabriczc_bitmap_test_set(sb, blk, false);
+    if (!ret) {
+        if (blk < sbi->alloc_hint) sbi->alloc_hint = blk;
         fabriczc_free_blocks_add(sb, 1);
+    }
+    mutex_unlock(&sbi->alloc_mutex);
     return ret;
+}
+
+/* -- Truncate and whole-tree release --------------------------------- */
+
+/* Blocks covered by one slot at `level` (level 1 is a single data block). */
+static u64 fabriczc_tree_span(u32 level)
+{
+    u64 span = 1;
+    u32 i;
+
+    for (i = 1; i < level; i++)
+        span *= FABRICZC_INDIRECT_ENTRIES;
+    return span;
+}
+
+/* Free every block below *slot; `freed` accumulates 512-byte sectors. */
+static void fabriczc_free_tree(struct super_block *sb, u64 *slot, u32 level,
+                               u64 *freed)
+{
+    u64 blk = *slot;
+    u64 *table;
+    int i;
+
+    if (blk == FABRICZC_BLOCK_FREE || blk == 0) {
+        *slot = FABRICZC_BLOCK_FREE;
+        return;
+    }
+    if (level <= 1) {
+        if (fabriczc_free_data_block(sb, blk) == 0)
+            *freed += 8;
+        *slot = FABRICZC_BLOCK_FREE;
+        return;
+    }
+    table = kmalloc(4096, GFP_NOFS);
+    if (table) {
+        if (fabriczc_read_block(sb, blk, table, 4096) == 0) {
+            for (i = 0; i < FABRICZC_INDIRECT_ENTRIES; i++)
+                fabriczc_free_tree(sb, &table[i], level - 1, freed);
+        }
+        kfree(table);
+    }
+    if (fabriczc_free_data_block(sb, blk) == 0)
+        *freed += 8;
+    *slot = FABRICZC_BLOCK_FREE;
+}
+
+/*
+ * Free only the part of a subtree that lies at or above logical block `keep`.
+ * `base` is the first logical block covered by *slot.
+ */
+static void fabriczc_truncate_walk(struct super_block *sb, u64 *slot, u32 level,
+                                   u64 base, u64 keep, u64 *freed)
+{
+    u64 span, blk = *slot, *table;
+    u64 child_span;
+    bool empty = true;
+    u32 i;
+
+    if (blk == FABRICZC_BLOCK_FREE || blk == 0) {
+        *slot = FABRICZC_BLOCK_FREE;
+        return;
+    }
+    span = fabriczc_tree_span(level);
+    if (base >= keep) {
+        fabriczc_free_tree(sb, slot, level, freed);
+        return;
+    }
+    if (base + span <= keep) return; /* wholly inside the kept range */
+    if (level <= 1) return;
+
+    table = kmalloc(4096, GFP_NOFS);
+    if (!table) return; /* leak rather than corrupt */
+    if (fabriczc_read_block(sb, blk, table, 4096)) {
+        kfree(table);
+        return;
+    }
+
+    child_span = span / FABRICZC_INDIRECT_ENTRIES;
+    for (i = 0; i < FABRICZC_INDIRECT_ENTRIES; i++) {
+        u64 child_base = base + (u64)i * child_span;
+
+        if (child_base >= keep) {
+            fabriczc_free_tree(sb, &table[i], level - 1, freed);
+        } else if (child_base + child_span > keep) {
+            fabriczc_truncate_walk(sb, &table[i], level - 1, child_base, keep,
+                                   freed);
+        }
+        if (table[i] != FABRICZC_BLOCK_FREE && table[i] != 0)
+            empty = false;
+    }
+
+    if (empty) {
+        kfree(table);
+        if (fabriczc_free_data_block(sb, blk) == 0)
+            *freed += 8;
+        *slot = FABRICZC_BLOCK_FREE;
+        return;
+    }
+    fabriczc_write_block(sb, blk, table, 4096);
+    kfree(table);
+}
+
+int fabriczc_truncate_blocks(struct inode *inode, u64 newsize)
+{
+    struct fabriczc_inode *raw = inode ? inode->i_private : NULL;
+    struct super_block *sb = inode ? inode->i_sb : NULL;
+    u64 keep = (newsize + 4095) >> 12;
+    u64 base, freed = 0;
+    u32 i;
+
+    if (!raw || !sb) return -EINVAL;
+
+    for (i = 0; i < FABRICZC_N_DIRECT_BLOCKS; i++) {
+        if ((u64)i < keep) continue;
+        if (raw->i_direct_blocks[i] == FABRICZC_BLOCK_FREE) continue;
+        if (fabriczc_free_data_block(sb, raw->i_direct_blocks[i]) == 0)
+            freed += 8;
+        raw->i_direct_blocks[i] = FABRICZC_BLOCK_FREE;
+    }
+
+    base = FABRICZC_N_DIRECT_BLOCKS;
+    fabriczc_truncate_walk(sb, &raw->i_indirect_block, 2, base, keep, &freed);
+    base += fabriczc_tree_span(2);
+    fabriczc_truncate_walk(sb, &raw->i_double_indirect_block, 3, base, keep, &freed);
+    base += fabriczc_tree_span(3);
+    fabriczc_truncate_walk(sb, &raw->i_triple_indirect_block, 4, base, keep, &freed);
+    base += fabriczc_tree_span(4);
+    fabriczc_truncate_walk(sb, &raw->i_quad_indirect_block, 5, base, keep, &freed);
+
+    raw->i_size_bytes = newsize;
+    raw->i_blocks_allocated = raw->i_blocks_allocated > freed
+                            ? raw->i_blocks_allocated - freed : 0;
+    fabriczc_inode_slot_write(sb, inode->i_ino, raw);
+    return 0;
 }
 
 int fabriczc_inode_slot_read(struct super_block *sb, u32 ino, struct fabriczc_inode *raw)
@@ -315,24 +445,50 @@ int fabriczc_inode_slot_write(struct super_block *sb, u32 ino, const struct fabr
     return 0;
 }
 
+/*
+ * Find a free inode slot starting at the cursor, scanning a whole table block
+ * (16 slots) at a time. Slots are u32 and the table can hold millions, so a
+ * restart-from-slot-1 scan would make every create progressively slower.
+ */
 int fabriczc_alloc_inode_slot(struct super_block *sb, u32 *out_ino)
 {
+    struct fabriczc_sb_info *sbi = sb ? (struct fabriczc_sb_info *)sb->s_fs_info : NULL;
     u64 total = fabriczc_sb_total_blocks(sb);
     u32 table_start = fabriczc_inode_table_start(total);
-    u32 table_blocks = FABRICZC_INODE_TABLE_BLOCKS;
-    u32 slots = table_blocks * (4096 / sizeof(struct fabriczc_inode));
-    u32 i;
+    u32 table_blocks = fabriczc_inode_table_blocks(total);
+    u32 per_block = 4096 / sizeof(struct fabriczc_inode);
+    u32 start_block, scanned;
 
-    if (unlikely(!out_ino)) return -EINVAL;
-    for (i = 1; i < slots; i++) {
-        struct fabriczc_inode raw;
-        if (fabriczc_inode_slot_read(sb, i, &raw) != 0) return -EIO;
-        if (raw.i_mode == 0) {
-            raw.i_mode = 1; /* claim slot immediately */
-            fabriczc_inode_slot_write(sb, i, &raw);
-            *out_ino = i;
+    if (unlikely(!out_ino || !sbi || !table_blocks)) return -EINVAL;
+
+    start_block = sbi->inode_hint / per_block;
+    if (start_block >= table_blocks) start_block = 0;
+
+    for (scanned = 0; scanned < table_blocks; scanned++) {
+        unsigned int idx;
+        u32 block = start_block + scanned;
+        struct buffer_head *bh;
+
+        if (block >= table_blocks) block -= table_blocks;
+        bh = sb_bread(sb, table_start + block);
+        if (!bh) return -EIO;
+        for (idx = 0; idx < per_block; idx++) {
+            struct fabriczc_inode *raw = (struct fabriczc_inode *)(bh->b_data +
+                                          (idx * sizeof(struct fabriczc_inode)));
+            u32 ino = block * per_block + idx;
+
+            if (ino == 0 || raw->i_mode != 0) continue;
+            memset(raw, 0, sizeof(*raw));
+            raw->i_mode = 1; /* claimed; the caller writes the real metadata */
+            mark_buffer_dirty(bh);
+            sync_dirty_buffer(bh);
+            brelse(bh);
+            sbi->inode_hint = ino + 1;
+            if (sbi->free_inodes) sbi->free_inodes--;
+            *out_ino = ino;
             return 0;
         }
+        brelse(bh);
     }
     return -ENOSPC;
 }
@@ -514,7 +670,31 @@ int fabriczc_read_inode_from_disk(struct super_block *sb, struct fabriczc_block_
 int fabriczc_allocate_file_extent(struct fabriczc_transaction_context *tx, void *header_page, u32 logical_block, u32 block_len, u32 physical_start) { return 0; }
 void fabriczc_evict_inode(struct inode *inode)
 {
+    struct super_block *sb = inode->i_sb;
+    struct fabriczc_inode *raw = inode->i_private;
+
     truncate_inode_pages_final(&inode->i_data);
-    if (inode->i_private) { kfree(inode->i_private); inode->i_private = NULL; }
+
+    if (raw) {
+        if (inode->i_nlink == 0) {
+            /*
+             * Last name is gone. Release the block tree and then the slot.
+             * Doing this here rather than in unlink() means an inode that is
+             * still open keeps its blocks, and the slot number cannot be
+             * handed to a new file while this VFS inode is cached.
+             */
+            struct fabriczc_sb_info *sbi = sb ? (struct fabriczc_sb_info *)sb->s_fs_info : NULL;
+
+            fabriczc_truncate_blocks(inode, 0);
+            memset(raw, 0, sizeof(*raw));
+            fabriczc_inode_slot_write(sb, inode->i_ino, raw);
+            if (sbi) sbi->free_inodes++;
+        } else {
+            raw->i_links_count = inode->i_nlink;
+            fabriczc_inode_slot_write(sb, inode->i_ino, raw);
+        }
+        kfree(raw);
+        inode->i_private = NULL;
+    }
     clear_inode(inode);
 }

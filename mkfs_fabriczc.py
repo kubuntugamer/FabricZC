@@ -1,84 +1,112 @@
 #!/usr/bin/env python3
-"""Minimal FabricZC layout generator."""
+"""FabricZC v3 layout generator.
 
-import argparse, os, sys, struct, binascii, random
+v3 layout (4 KiB blocks):
+    0                      root directory block
+    2                      superblock
+    3                      journal header
+    [4, 4+bmp)             allocation bitmap, 1 bit per block
+    [itis, itis+table)     inode table, 256-byte slots, index == inode number
+    [data_start, total)    file data
 
-# Floppy-style layout constants matching src/fs/fs_main.c & include/fabriczc_common.h
-FABRICZC_SB_MAGIC      = 0x465A4332 # "FZC2" (v2, 64-bit block pointers)
-FABRICZC_JOURNAL_MAGIC = 0x4A4E4C4D # "JNLM"
-FABRICZC_BLOCK_FREE    = 0xFFFFFFFFFFFFFFFF
+The inode table is sized from the volume (one inode per 16 KiB), so a real
+distribution tree fits.
+"""
+
+import argparse
+import array
+import fcntl
+import os
+import struct
+import sys
+
+FABRICZC_SB_MAGIC = 0x465A4333  # "FZC3"
+FABRICZC_JOURNAL_MAGIC = 0x4A4E4C4D  # "JNLM"
+FABRICZC_BLOCK_FREE = 0xFFFFFFFFFFFFFFFF
 FABRICZC_JOURNAL_BLOCK = 3
-FABRICZC_BITMAP_START  = 4
-FABRICZC_INODE_TABLE_BLOCKS = 1024
+FABRICZC_BITMAP_START = 4
 FABRICZC_BITS_PER_BLOCK = 4096 * 8
-FABRICZC_MIN_DISKS      = 1
-FABRICZC_MAX_DISKS      = 8
 
-FABRICZC_NAME_LEN = 255
+FABRICZC_INODE_TABLE_MIN_BLOCKS = 1024
+FABRICZC_DATA_BLOCKS_PER_TABLE = 64
+FABRICZC_MAX_INODE_SLOTS = 0x7FFFFFFF
 
-# Offsets calculated from include/fabriczc_common.h struct layouts +
-# C standard alignment rules on 64-bit. (Verified by compiling a test.)
+INODE_SIZE = 256
+SLOTS_PER_BLOCK = 4096 // INODE_SIZE
+NAME_LEN = 255
 
-def inode_size():
-    # sizeof(struct fabriczc_inode) -- v2 is padded to 256 so it divides 4096
-    return 256
 
-def inode_table_capacity(total_blocks):
-    return FABRICZC_INODE_TABLE_BLOCKS * (4096 // inode_size())
+def inode_table_blocks(total_blocks):
+    blocks = max(total_blocks // FABRICZC_DATA_BLOCKS_PER_TABLE,
+                 FABRICZC_INODE_TABLE_MIN_BLOCKS)
+    if blocks * SLOTS_PER_BLOCK > FABRICZC_MAX_INODE_SLOTS:
+        blocks = FABRICZC_MAX_INODE_SLOTS // SLOTS_PER_BLOCK
+    return blocks
+
 
 def bitmap_block_count(total_blocks):
     return (total_blocks + FABRICZC_BITS_PER_BLOCK - 1) // FABRICZC_BITS_PER_BLOCK
 
+
 def inode_table_start(total_blocks):
     return FABRICZC_BITMAP_START + bitmap_block_count(total_blocks)
 
-def compute_data_start(total_blocks):
-    return inode_table_start(total_blocks) + FABRICZC_INODE_TABLE_BLOCKS
 
-def pack_superblock():
-    # offset                      kind  v
-    buf = bytearray(64)
-    struct.pack_into('<I', buf, 0, FABRICZC_SB_MAGIC)          # sb_magic
-    struct.pack_into('<I', buf, 4, 1)                           # sb_state = clean
-    struct.pack_into('<Q', buf, 8, 0)                           # block_count later
-    struct.pack_into('<Q', buf, 16, 0)                          # free_blocks later
-    struct.pack_into('<I', buf, 24, 4096)                       # block_size_bytes
-    struct.pack_into('<16s', buf, 28, b'\x11\x22\x33\x44\x55\x66\x77\x88\x99\xaa\xbb\xcc\xdd\xee\xff\x00') # uuid
-    struct.pack_into('<q', buf, 48, 0)                          # last_mount_time
-    struct.pack_into('<I', buf, 56, 0)                          # sb_checksum
+def data_start(total_blocks):
+    return inode_table_start(total_blocks) + inode_table_blocks(total_blocks)
+
+
+def pack_superblock(total_blocks, free_blocks, free_inodes):
+    buf = bytearray(72)
+    struct.pack_into('<I', buf, 0, FABRICZC_SB_MAGIC)
+    struct.pack_into('<I', buf, 4, 1)                    # sb_state = clean
+    struct.pack_into('<Q', buf, 8, total_blocks)         # block_count
+    struct.pack_into('<Q', buf, 16, free_blocks)         # free_blocks
+    struct.pack_into('<I', buf, 24, 4096)                # block_size_bytes
+    struct.pack_into('<16s', buf, 28,
+                     b'\x11\x22\x33\x44\x55\x66\x77\x88\x99\xaa\xbb\xcc\xdd\xee\xff\x00')
+    struct.pack_into('<q', buf, 48, 0)                   # last_mount_time
+    chk = 0
+    for i in range(0, 56, 4):
+        chk ^= struct.unpack_from('<I', buf, i)[0]
+    struct.pack_into('<I', buf, 56, chk)
+    struct.pack_into('<Q', buf, 64, free_inodes)
     return buf
+
 
 def pack_journal():
     buf = bytearray(4096)
-    struct.pack_into('<I', buf, 0, FABRICZC_JOURNAL_MAGIC) # jh_magic
-    struct.pack_into('<I', buf, 4, 4096)                    # jh_block_size
-    struct.pack_into('<Q', buf, 8, 0)                       # jh_total_records
-    struct.pack_into('<I', buf, 16, 0)                      # jh_head_offset
-    struct.pack_into('<I', buf, 20, 0)                      # jh_tail_offset
-    struct.pack_into('<I', buf, 24, 1)                      # jh_sequence_num
+    struct.pack_into('<I', buf, 0, FABRICZC_JOURNAL_MAGIC)
+    struct.pack_into('<I', buf, 4, 4096)
+    struct.pack_into('<Q', buf, 8, 0)
+    struct.pack_into('<I', buf, 16, 0)
+    struct.pack_into('<I', buf, 20, 0)
+    struct.pack_into('<I', buf, 24, 1)
     return buf
 
-def pack_inode_root():
-    buf = bytearray(inode_size())
-    struct.pack_into('<H', buf, 0, 0x41ED)                   # mode: S_IFDIR | 0755
-    struct.pack_into('<H', buf, 2, 2)                        # i_links_count
-    struct.pack_into('<I', buf, 4, 0)                        # i_uid
-    struct.pack_into('<I', buf, 8, 0)                        # i_gid
-    struct.pack_into('<Q', buf, 16, 4096)                    # i_size_bytes
-    struct.pack_into('<Q', buf, 24, 8)                       # i_blocks_allocated
-    struct.pack_into('<I', buf, 32, 0)                       # i_generation
-    struct.pack_into('<I', buf, 36, 0)                       # i_checksum
+
+def pack_inode_root(root_dir_block):
+    buf = bytearray(INODE_SIZE)
+    struct.pack_into('<H', buf, 0, 0x41ED)               # S_IFDIR | 0755
+    struct.pack_into('<H', buf, 2, 2)                    # i_links_count
+    struct.pack_into('<I', buf, 4, 0)                    # i_uid
+    struct.pack_into('<I', buf, 8, 0)                    # i_gid
+    struct.pack_into('<Q', buf, 16, 4096)                # i_size_bytes
+    struct.pack_into('<Q', buf, 24, 8)                   # i_blocks_allocated
+    struct.pack_into('<I', buf, 32, 0)                   # i_generation
+    struct.pack_into('<I', buf, 36, 0)                   # i_checksum
     for i in range(12):
-        struct.pack_into('<Q', buf, 40 + i*8, FABRICZC_BLOCK_FREE)
-    struct.pack_into('<Q', buf, 40, 0)                       # direct[0] -> root dir block 0
-    for off in (136, 144, 152, 160):                         # indirect..quad
+        struct.pack_into('<Q', buf, 40 + i * 8, FABRICZC_BLOCK_FREE)
+    struct.pack_into('<Q', buf, 40, root_dir_block)      # direct[0] -> root dir
+    for off in (136, 144, 152, 160):
         struct.pack_into('<Q', buf, off, FABRICZC_BLOCK_FREE)
     return buf
 
+
 def main():
-    p = argparse.ArgumentParser(description="mkfs.fabriczc minimal layout generator")
+    p = argparse.ArgumentParser(description="mkfs.fabriczc v3 layout generator")
     p.add_argument('device', help='Block device or image file')
-    p.add_argument('--size', type=int, default=0, help='Size in bytes (for image files); 0 means use device reported size')
+    p.add_argument('--size', type=int, default=0, help='Size in bytes (image files)')
     args = p.parse_args()
 
     path = args.device
@@ -92,93 +120,75 @@ def main():
         if st.st_size > 0:
             total_bytes = st.st_size
         else:
-            # block device or special file: try BLKGETSIZE64
-            import fcntl
-            import termios
-            import array
             sz = array.array('L', [0])
-            # BLKGETSIZE64
             try:
-                fcntl.ioctl(f.fileno(), 0x80081272, sz, True)
+                fcntl.ioctl(f.fileno(), 0x80081272, sz, True)   # BLKGETSIZE64
                 total_bytes = sz[0]
             except OSError:
-                print('Unable to determine device size; pipe size via --size or use an existing file.')
-                sys.exit(1)
+                total_bytes = 0
             if total_bytes == 0:
-                try:
-                    import struct as _st
-                    f.seek(0, os.SEEK_END)
-                    total_bytes = f.tell()
-                except OSError:
-                    pass
-        if total_bytes == 0:
-            print('Cannot determine size. If image file, use a spare file or pre-allocate with dd.')
-            sys.exit(1)
+                print('Unable to determine device size.')
+                sys.exit(1)
 
         total_blocks = total_bytes // 4096
-        bitmap_blocks = bitmap_block_count(total_blocks)
+        if total_blocks < 1024:
+            print('Device too small for a FabricZC filesystem (need >= 4 MiB).')
+            sys.exit(1)
+
+        bmp_blocks = bitmap_block_count(total_blocks)
         table_start = inode_table_start(total_blocks)
-        data_start = compute_data_start(total_blocks)
+        table_blocks = inode_table_blocks(total_blocks)
+        first_data = data_start(total_blocks)
+        slots = table_blocks * SLOTS_PER_BLOCK
 
         print(f'Target: {path}')
         print(f'Total bytes: {total_bytes}')
         print(f'Total 4K blocks: {total_blocks}')
-        print(f'Bitmap region: {FABRICZC_BITMAP_START} .. {FABRICZC_BITMAP_START + bitmap_blocks - 1} ({bitmap_blocks} blocks)')
-        print(f'Inode table:   {table_start} .. {table_start + FABRICZC_INODE_TABLE_BLOCKS - 1} ({FABRICZC_INODE_TABLE_BLOCKS} blocks)')
-        print(f'Data region:   {data_start} .. {total_blocks-1}')
+        print(f'Bitmap region: {FABRICZC_BITMAP_START} .. '
+              f'{FABRICZC_BITMAP_START + bmp_blocks - 1} ({bmp_blocks} blocks)')
+        print(f'Inode table:   {table_start} .. {table_start + table_blocks - 1} '
+              f'({table_blocks} blocks, {slots} slots)')
+        print(f'Data region:   {first_data} .. {total_blocks - 1} '
+              f'({total_blocks - first_data} blocks)')
 
-        # 1) zero the whole metadata region (simplifies root dir scan)
-        zero = bytearray(4096)
-        for b in range(0, min(table_start + FABRICZC_INODE_TABLE_BLOCKS, total_blocks)):
-            f.seek(b*4096)
+        zero = bytes(4096)
+
+        # Zero every metadata block (also clears block 0, the root directory).
+        for b in range(0, min(first_data, total_blocks)):
+            f.seek(b * 4096)
             f.write(zero)
 
-        # 2) write superblock at block 2
-        sb = bytearray(pack_superblock())
-        # block_count
-        struct.pack_into('<Q', sb, 8, total_blocks)
-        # free_blocks = data region blocks
-        free_blocks = total_blocks - data_start
-        free_blocks = max(free_blocks, 0)
-        struct.pack_into('<Q', sb, 16, free_blocks)
-        # checksum of first 56 bytes (xor-fold) just to have a value
-        chk = 0
-        for i in range(0, 56, 4):
-            chk ^= struct.unpack_from('<I', sb, i)[0]
-        struct.pack_into('<I', sb, 56, chk)
-        f.seek(2*4096)
-        f.write(sb)
+        # The root directory gets its own data block, allocated out of the data
+        # region, so physical block 0 stays untouched and is never used as a
+        # file block (0 is the "unset pointer" sentinel in the block tree).
+        root_dir_block = first_data
+        free_blocks = max(total_blocks - first_data - 1, 0)
+        free_inodes = max(slots - 2, 0)  # slot 0 reserved, slot 1 is root
+        f.seek(2 * 4096)
+        f.write(pack_superblock(total_blocks, free_blocks, free_inodes))
 
-        # 3) journal at block 3
-        f.seek(3*4096)
+        f.seek(FABRICZC_JOURNAL_BLOCK * 4096)
         f.write(pack_journal())
 
-        # 4) inode table: zero all, then write root inode at slot 1
-        table_start = inode_table_start(total_blocks)
-        for b in range(table_start, table_start + FABRICZC_INODE_TABLE_BLOCKS):
-            f.seek(b*4096)
-            f.write(zero)
-        inode_slot = table_start * 4096 + inode_size() * 1
-        f.seek(inode_slot)
-        f.write(pack_inode_root())
+        f.seek(table_start * 4096 + INODE_SIZE * 1)
+        f.write(pack_inode_root(root_dir_block))
 
-        # 5) bitmap: set bits for blocks < data_start as used
-        bitmap_region = bytearray(bitmap_blocks * 4096)
-        for b in range(0, data_start):
-            global_bit = b
-            bmp_block = global_bit // FABRICZC_BITS_PER_BLOCK
-            bit = global_bit % FABRICZC_BITS_PER_BLOCK
-            bitmap_region[bmp_block*4096 + bit//8] |= (1 << (bit % 8))
-        f.seek(FABRICZC_BITMAP_START * 4096)
-        f.write(bitmap_region)
-
-        # 6) root directory block 0: leave zeros (empty)
-        f.seek(0)
+        # Empty root directory block.
+        f.seek(root_dir_block * 4096)
         f.write(zero)
+
+        # Mark every metadata block and the root directory block as allocated.
+        bitmap = bytearray(bmp_blocks * 4096)
+        for b in range(0, min(first_data + 1, total_blocks)):
+            bitmap[b // 8] |= 1 << (b % 8)
+        f.seek(FABRICZC_BITMAP_START * 4096)
+        f.write(bitmap)
+
         f.flush()
         os.fsync(f.fileno())
 
     print('mkfs.fabriczc: done.')
+
 
 if __name__ == '__main__':
     main()

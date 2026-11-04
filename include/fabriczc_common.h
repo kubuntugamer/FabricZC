@@ -32,7 +32,7 @@ struct fabriczc_array_metadata {
     u32 checksum;            /* Structural integrity validation check */
 };
 
-#define FABRICZC_SB_MAGIC       0x465A4332  /* "FZC2" Superblock Magic (v2, 64-bit pointers) */
+#define FABRICZC_SB_MAGIC       0x465A4333  /* "FZC3" Superblock Magic (v3, compact dirents, sized inode table) */
 #define FABRICZC_STATE_CLEAN    0x00000001
 #define FABRICZC_STATE_DIRTY    0x00000002
 
@@ -46,6 +46,7 @@ struct fabriczc_superblock {
     u8  fs_uuid[16];          /* Unique cryptographic volume tracking identifier */
     s64 last_mount_time;      /* UNIX epoch timestamp registration marker */
     u32 sb_checksum;          /* Cryptographic structure validation hash checks */
+    u64 free_inodes;          /* free inode slots, persisted across mounts */
 };
 
 #define FABRICZC_BITS_PER_BLOCK (4096 * 8) /* 32,768 clusters tracked per bitmap block */
@@ -90,14 +91,21 @@ struct fabriczc_inode {
 
 #define FABRICZC_NAME_LEN 255
 
-/* Master on-disk storage layout representation for directory records */
+/*
+ * v3 directory record: 8-byte header followed by the name (not NUL-terminated).
+ * v2 embedded a 255-byte name array in every entry, which capped a directory at
+ * 180 files; this layout fits 256 minimum-size records per 4 KiB block and lets
+ * a directory grow through the block tree.
+ */
 struct fabriczc_dir_entry {
     u32 inode_number;             /* Numeric metadata node tracking index for this file record */
-    u16 record_length_bytes;      /* Total packing alignment size step size for this record entry */
-    u8  name_length;              /* True length tracking value for the string path payload */
+    u16 record_length_bytes;      /* Size of this record, 8-byte aligned, >= 16 */
+    u8  name_length;              /* Length of the name that follows the header */
     u8  file_type;                /* Directory layout type marker (File, Directory, etc.) */
-    char file_name[FABRICZC_NAME_LEN]; /* Aligned string data array housing the actual name */
-};
+} __attribute__((packed));
+
+#define FABRICZC_DIRENT_HEADER  8u
+#define FABRICZC_DIRENT_MIN_REC 16u
 
 #define FABRICZC_EXTENT_MAGIC   0xE17E6463 /* "EXDC" Extent Descriptor Container Magic */
 
@@ -115,7 +123,27 @@ struct fabriczc_dir_entry {
 #define FABRICZC_SB_BLOCK    2u
 #define FABRICZC_JOURNAL_BLOCK 3u
 #define FABRICZC_BITMAP_START  4u
-#define FABRICZC_INODE_TABLE_BLOCKS 1024u /* 256 KiB table == 16,384 slots */
+/*
+ * v3 inode table sizing: one 256-byte inode per 16 KiB of storage, i.e. one
+ * 4 KiB table block (16 slots) per 64 data blocks. A 64 GiB root therefore gets
+ * ~4.2 million slots instead of the fixed 16,383 that made an OS install
+ * impossible. Slot numbers are u32, so the table is capped at 2^31-1 slots.
+ */
+#define FABRICZC_INODE_TABLE_MIN_BLOCKS 1024u
+#define FABRICZC_DATA_BLOCKS_PER_TABLE  64u
+#define FABRICZC_MAX_INODE_SLOTS        0x7FFFFFFFu
+
+static inline u32 fabriczc_inode_table_blocks(u64 total_blocks)
+{
+    u64 blocks = total_blocks / FABRICZC_DATA_BLOCKS_PER_TABLE;
+    u64 slots_per_block = 4096 / sizeof(struct fabriczc_inode);
+
+    if (blocks < FABRICZC_INODE_TABLE_MIN_BLOCKS)
+        blocks = FABRICZC_INODE_TABLE_MIN_BLOCKS;
+    if (blocks * slots_per_block > FABRICZC_MAX_INODE_SLOTS)
+        blocks = FABRICZC_MAX_INODE_SLOTS / slots_per_block;
+    return (u32)blocks;
+}
 
 static inline u32 fabriczc_bitmap_block_count(u64 total_blocks)
 {
@@ -129,7 +157,8 @@ static inline u32 fabriczc_inode_table_start(u64 total_blocks)
 
 static inline u64 fabriczc_data_start(u64 total_blocks)
 {
-    return (u64)fabriczc_inode_table_start(total_blocks) + FABRICZC_INODE_TABLE_BLOCKS;
+    return (u64)fabriczc_inode_table_start(total_blocks) +
+           fabriczc_inode_table_blocks(total_blocks);
 }
 
 /* Master compact on-disk layout representing a contiguous span of data block allocations */

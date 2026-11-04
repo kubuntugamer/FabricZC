@@ -58,7 +58,6 @@ int fabriczc_sync_block_bitmaps(struct super_block *sb,
                                struct fabriczc_block_group_desc *caches,
                                u32 group_count);
 
-int fabriczc_add_directory_entry(struct buffer_head *bh, const char *name, u32 target_inode, u8 file_type);
 u32 fabriczc_lookup_extent_block(void *header_page, u32 logical_block);
 int fabriczc_insert_extent_descriptor(void *header_page, u32 logical_block, u32 block_len, u32 physical_start);
 
@@ -118,6 +117,10 @@ int fabriczc_get_block(struct inode *inode, sector_t iblock, struct buffer_head 
 struct fabriczc_sb_info {
     u64 free_blocks;
     spinlock_t free_lock;
+    u64 alloc_hint;           /* block index to start the next bitmap scan at */
+    struct mutex alloc_mutex; /* serialises bitmap claim/release */
+    u32 inode_hint;           /* inode slot to start the next scan at */
+    u64 free_inodes;          /* live free-slot count, mirrored to the superblock */
 };
 
 int fabriczc_fs_init(void);
@@ -141,3 +144,6 @@ int fabriczc_inode_slot_write(struct super_block *sb, u32 ino, const struct fabr
 int fabriczc_bmap_block(struct inode *inode, u64 iblock, u64 *phys, bool create);
 int fabriczc_read_block(struct super_block *sb, u64 block, void *buf, u32 len);
 int fabriczc_write_block(struct super_block *sb, u64 block, const void *buf, u32 len);
+
+/* Free the data and index blocks of `inode` at or above `newsize`. */
+int fabriczc_truncate_blocks(struct inode *inode, u64 newsize);
