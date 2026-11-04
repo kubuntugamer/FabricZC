@@ -898,6 +898,8 @@ static int fabriczc_fill_super(struct super_block *sb, struct fs_context *fc)
 {
     struct inode *root;
     struct fabriczc_inode *raw_root;
+    struct fabriczc_superblock *sbk;
+    struct fabriczc_sb_info *sbi;
     char *sb_buf;
     int ret;
 
@@ -910,10 +912,17 @@ static int fabriczc_fill_super(struct super_block *sb, struct fs_context *fc)
     sb_buf = kmalloc(4096, GFP_KERNEL);
     if (!sb_buf) return -ENOMEM;
     ret = fabriczc_read_block(sb, FABRICZC_SB_BLOCK, sb_buf, 4096);
-    if (ret || ((struct fabriczc_superblock *)sb_buf)->sb_magic != FABRICZC_SB_MAGIC) {
+    sbk = (struct fabriczc_superblock *)sb_buf;
+    if (ret || sbk->sb_magic != FABRICZC_SB_MAGIC) {
         kfree(sb_buf);
         return -EILSEQ; /* not a FabricZC image */
     }
+
+    sbi = kzalloc(sizeof(*sbi), GFP_KERNEL);
+    if (!sbi) { kfree(sb_buf); return -ENOMEM; }
+    spin_lock_init(&sbi->free_lock);
+    sbi->free_blocks = sbk->free_blocks;
+    sb->s_fs_info = sbi;
     kfree(sb_buf);
 
     fabriczc_mount_journal(sb, FABRICZC_JOURNAL_BLOCK);
@@ -969,12 +978,16 @@ static struct file_system_type fabriczc_fs_type = {
     .fs_flags        = FS_REQUIRES_DEV,
 };
 
+/*
+ * O(1): reports the live count maintained by the allocation paths. Counting
+ * free bits by reading every bitmap block meant ~119k block reads (476 MB) on
+ * the 14.6 TB array, i.e. 10-14 s per call, which stalled every df/umount.
+ */
 static int fabriczc_statfs(struct dentry *dentry, struct kstatfs *buf)
 {
     struct super_block *sb = dentry->d_sb;
-    u64 total = 0, free = 0;
-    char *blk;
-    u32 bmp, bit;
+    struct fabriczc_sb_info *sbi;
+    u64 total;
 
     memset(buf, 0, sizeof(*buf));
     buf->f_type   = FABRICZC_SB_MAGIC;
@@ -984,23 +997,18 @@ static int fabriczc_statfs(struct dentry *dentry, struct kstatfs *buf)
     if (!sb || !sb->s_bdev) return -ENODEV;
     total = bdev_nr_bytes(sb->s_bdev) >> 12;
     buf->f_blocks = total;
+    buf->f_files = total;
 
-    blk = kmalloc(4096, GFP_KERNEL);
-    if (!blk) return 0;
-    for (bmp = 0; bmp < fabriczc_bitmap_block_count(total); bmp++) {
-        if (fabriczc_read_block(sb, FABRICZC_BITMAP_START + bmp, blk, 4096))
-            break;
-        for (bit = 0; bit < FABRICZC_BITS_PER_BLOCK; bit++) {
-            u64 glob = (u64)bmp * FABRICZC_BITS_PER_BLOCK + bit;
-            if (glob >= total) break;
-            if (!test_bit(bit, (unsigned long *)blk))
-                free++;
-        }
+    sbi = (struct fabriczc_sb_info *)sb->s_fs_info;
+    if (sbi) {
+        unsigned long flags;
+
+        spin_lock_irqsave(&sbi->free_lock, flags);
+        buf->f_bfree = sbi->free_blocks;
+        spin_unlock_irqrestore(&sbi->free_lock, flags);
+        if (buf->f_bfree > total) buf->f_bfree = total;
+        buf->f_bavail = buf->f_bfree;
     }
-    kfree(blk);
-    buf->f_bfree = free > fabriczc_data_start(total) ? free - fabriczc_data_start(total) : 0;
-    buf->f_bavail = buf->f_bfree;
-    buf->f_files = bdev_nr_bytes(sb->s_bdev) >> 12;
     return 0;
 }
 
@@ -1014,7 +1022,43 @@ static const struct super_operations fabriczc_super_ops = {
  * generic_shutdown_super() already runs sync_filesystem() before ->put_super,
  * so a second sync here is redundant. Metadata buffers are flushed
  * synchronously (sync_dirty_buffer) when they are written.
+ *
+ * Persist the live free-block count so the next mount can report it without
+ * rescanning the bitmap; the bitmap stays authoritative for allocation.
  */
-void fabriczc_put_super(struct super_block *sb) { (void)sb; }
+void fabriczc_put_super(struct super_block *sb)
+{
+    struct fabriczc_sb_info *sbi = sb ? (struct fabriczc_sb_info *)sb->s_fs_info : NULL;
+    char *buf;
+
+    if (!sbi) return;
+
+    /*
+     * The superblock lives on the target device, not on the synthetic
+     * /dev/fabriczc0 that sb->s_bdev points at, so it is read and written with
+     * the raw metadata helpers. sb_bread() here silently wrote to the wrong
+     * device and the count never reached the array.
+     */
+    buf = kmalloc(4096, GFP_KERNEL);
+    if (buf && fabriczc_read_block(sb, FABRICZC_SB_BLOCK, buf, 4096) == 0) {
+        struct fabriczc_superblock *sbk = (struct fabriczc_superblock *)buf;
+        struct fabriczc_runtime_context *ctx;
+        unsigned long flags;
+
+        spin_lock_irqsave(&sbi->free_lock, flags);
+        sbk->free_blocks = sbi->free_blocks;
+        spin_unlock_irqrestore(&sbi->free_lock, flags);
+
+        if (fabriczc_write_block(sb, FABRICZC_SB_BLOCK, buf, 4096) == 0) {
+            ctx = fabriczc_get_runtime_ctx();
+            if (ctx && ctx->bdev)
+                sync_blockdev(ctx->bdev);
+        }
+    }
+    kfree(buf);
+
+    kfree(sbi);
+    sb->s_fs_info = NULL;
+}
 int fabriczc_fs_init(void) { return register_filesystem(&fabriczc_fs_type); }
 void fabriczc_fs_exit(void) { unregister_filesystem(&fabriczc_fs_type); }

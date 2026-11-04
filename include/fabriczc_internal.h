@@ -114,6 +114,12 @@ extern int fabriczc_get_block(struct inode *inode, sector_t iblock, struct buffe
 
 int fabriczc_get_block(struct inode *inode, sector_t iblock, struct buffer_head *bh_result, int create);
 
+/* Live per-mount accounting; the on-disk allocation bitmap stays authoritative. */
+struct fabriczc_sb_info {
+    u64 free_blocks;
+    spinlock_t free_lock;
+};
+
 int fabriczc_fs_init(void);
 void fabriczc_fs_exit(void);
 
