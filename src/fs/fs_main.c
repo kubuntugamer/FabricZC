@@ -1010,6 +1010,11 @@ static const struct super_operations fabriczc_super_ops = {
     .statfs         = fabriczc_statfs,
 };
 
-void fabriczc_put_super(struct super_block *sb) { if (sb) sync_filesystem(sb); }
+/*
+ * generic_shutdown_super() already runs sync_filesystem() before ->put_super,
+ * so a second sync here is redundant. Metadata buffers are flushed
+ * synchronously (sync_dirty_buffer) when they are written.
+ */
+void fabriczc_put_super(struct super_block *sb) { (void)sb; }
 int fabriczc_fs_init(void) { return register_filesystem(&fabriczc_fs_type); }
 void fabriczc_fs_exit(void) { unregister_filesystem(&fabriczc_fs_type); }
