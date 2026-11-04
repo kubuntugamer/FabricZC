@@ -52,8 +52,8 @@ static int fabriczc_read_folio(struct file *file, struct folio *folio)
 
         memset(buf, 0, 4096);
         if (p < raw->i_size_bytes) {
-            u32 phys;
-            ret = fabriczc_bmap_block(inode, (u32)(p >> 12), &phys, false);
+            u64 phys;
+            ret = fabriczc_bmap_block(inode, (u64)(p >> 12), &phys, false);
             if (ret) goto out;
             if (phys != FABRICZC_BLOCK_FREE) {
                 ret = fabriczc_read_block(sb, phys, buf, 4096);
@@ -114,10 +114,10 @@ static int fabriczc_writepages(struct address_space *mapping,
         for (done = 0; done < fsize; done += 4096) {
             loff_t p = pos + done;
             size_t n = min_t(size_t, fsize - done, 4096);
-            u32 phys;
+            u64 phys;
 
             if (p >= raw->i_size_bytes) break; /* nothing past EOF to persist */
-            ret = fabriczc_bmap_block(inode, (u32)(p >> 12), &phys, true);
+            ret = fabriczc_bmap_block(inode, (u64)(p >> 12), &phys, true);
             if (ret) break;
             memcpy(buf, folio_address(folio) + done, n);
             if (n < 4096) memset(buf + n, 0, 4096 - n);
@@ -161,7 +161,7 @@ static const struct inode_operations fabriczc_symlink_inode_operations;
 static int fabriczc_dir_read(struct inode *dir, u32 which, char *buf)
 {
     struct fabriczc_inode *raw = dir->i_private;
-    u32 phys = raw->i_direct_blocks[which];
+    u64 phys = raw->i_direct_blocks[which];
     if (phys == FABRICZC_BLOCK_FREE) return -ENOENT;
     return fabriczc_read_block(dir->i_sb, phys, buf, 4096);
 }
@@ -169,7 +169,7 @@ static int fabriczc_dir_read(struct inode *dir, u32 which, char *buf)
 static int fabriczc_dir_write(struct inode *dir, u32 which, const char *buf)
 {
     struct fabriczc_inode *raw = dir->i_private;
-    u32 phys = raw->i_direct_blocks[which];
+    u64 phys = raw->i_direct_blocks[which];
     if (phys == FABRICZC_BLOCK_FREE) return -ENOENT;
     return fabriczc_write_block(dir->i_sb, phys, buf, 4096);
 }
@@ -192,7 +192,7 @@ static int fabriczc_dir_add_entry(struct inode *dir, const char *name, u32 ino, 
         unsigned int off = 0;
 
         if (raw->i_direct_blocks[i] == FABRICZC_BLOCK_FREE) {
-            u32 nb;
+            u64 nb;
             if (fabriczc_alloc_data_block(sb, &nb)) { ret = -ENOSPC; goto out; }
             memset(buf, 0, 4096);
             ret = fabriczc_write_block(sb, nb, buf, 4096);
@@ -374,10 +374,10 @@ static ssize_t fabriczc_read_iter(struct kiocb *iocb, struct iov_iter *to)
     if (!buf) return -ENOMEM;
 
     while (count > 0) {
-        u32 iblock = pos >> 12;
+        u64 iblock = pos >> 12;
         u32 off = pos & 4095;
         size_t n = min_t(size_t, count, 4096 - off);
-        u32 phys;
+        u64 phys;
 
         ret = fabriczc_bmap_block(inode, iblock, &phys, false);
         if (ret) break;
@@ -414,10 +414,10 @@ static ssize_t fabriczc_write_iter(struct kiocb *iocb, struct iov_iter *from)
     if (!buf) return -ENOMEM;
 
     while (count > 0) {
-        u32 iblock = pos >> 12;
+        u64 iblock = pos >> 12;
         u32 off = pos & 4095;
         size_t n = min_t(size_t, count, 4096 - off);
-        u32 phys;
+        u64 phys;
         bool full = (off == 0 && n == 4096);
 
         ret = fabriczc_bmap_block(inode, iblock, &phys, true);
@@ -477,7 +477,7 @@ static int fabriczc_iterate(struct file *file, struct dir_context *ctx)
 
     for (direct = 0; direct < FABRICZC_N_DIRECT_BLOCKS; direct++) {
         unsigned int off = 0;
-        u32 phys = raw->i_direct_blocks[direct];
+        u64 phys = raw->i_direct_blocks[direct];
 
         if (phys == FABRICZC_BLOCK_FREE) break;
         if (fabriczc_read_block(inode->i_sb, phys, buf, 4096)) break;
@@ -541,6 +541,10 @@ static int fabriczc_unlink(struct inode *dir, struct dentry *dentry)
             raw->i_blocks_allocated = 0;
             raw->i_indirect_block = FABRICZC_BLOCK_FREE;
             raw->i_double_indirect_block = FABRICZC_BLOCK_FREE;
+            raw->i_triple_indirect_block = FABRICZC_BLOCK_FREE;
+            raw->i_quad_indirect_block = FABRICZC_BLOCK_FREE;
+    raw->i_triple_indirect_block = FABRICZC_BLOCK_FREE;
+    raw->i_quad_indirect_block = FABRICZC_BLOCK_FREE;
             fabriczc_inode_slot_write(dir->i_sb, ino, raw);
         }
         kfree(raw);
@@ -569,6 +573,8 @@ static int fabriczc_create(struct mnt_idmap *idmap, struct inode *dir,
     raw->i_generation = 0;
     raw->i_indirect_block = FABRICZC_BLOCK_FREE;
     raw->i_double_indirect_block = FABRICZC_BLOCK_FREE;
+    raw->i_triple_indirect_block = FABRICZC_BLOCK_FREE;
+    raw->i_quad_indirect_block = FABRICZC_BLOCK_FREE;
     memset(raw->i_direct_blocks, 0xFF, sizeof(raw->i_direct_blocks));
     ret = fabriczc_inode_slot_write(sb, ino, raw);
     if (ret) { kfree(raw); goto err_slot; }
@@ -605,7 +611,7 @@ static struct dentry *fabriczc_mkdir(struct mnt_idmap *idmap, struct inode *dir,
     struct fabriczc_inode *raw;
     struct inode *inode;
     u32 ino;
-    u32 dblk;
+    u64 dblk;
     int ret = fabriczc_alloc_inode_slot(sb, &ino);
     if (ret) return ERR_PTR(ret);
 
@@ -629,6 +635,8 @@ static struct dentry *fabriczc_mkdir(struct mnt_idmap *idmap, struct inode *dir,
     raw->i_generation = 0;
     raw->i_indirect_block = FABRICZC_BLOCK_FREE;
     raw->i_double_indirect_block = FABRICZC_BLOCK_FREE;
+    raw->i_triple_indirect_block = FABRICZC_BLOCK_FREE;
+    raw->i_quad_indirect_block = FABRICZC_BLOCK_FREE;
     memset(raw->i_direct_blocks, 0xFF, sizeof(raw->i_direct_blocks));
     raw->i_direct_blocks[0] = dblk;
     ret = fabriczc_inode_slot_write(sb, ino, raw);
@@ -667,7 +675,8 @@ static int fabriczc_symlink(struct mnt_idmap *idmap, struct inode *dir,
     struct super_block *sb = dir->i_sb;
     struct fabriczc_inode *raw;
     struct inode *inode;
-    u32 ino, dblk;
+    u32 ino;
+    u64 dblk;
     u64 len = strlen(symname);
     int ret = fabriczc_alloc_inode_slot(sb, &ino);
     if (ret) return ret;
@@ -685,6 +694,8 @@ static int fabriczc_symlink(struct mnt_idmap *idmap, struct inode *dir,
     raw->i_generation = 0;
     raw->i_indirect_block = FABRICZC_BLOCK_FREE;
     raw->i_double_indirect_block = FABRICZC_BLOCK_FREE;
+    raw->i_triple_indirect_block = FABRICZC_BLOCK_FREE;
+    raw->i_quad_indirect_block = FABRICZC_BLOCK_FREE;
     memset(raw->i_direct_blocks, 0xFF, sizeof(raw->i_direct_blocks));
     raw->i_direct_blocks[0] = dblk;
     fabriczc_write_block(sb, dblk, symname, (u32)min(len, (u64)4096));
@@ -737,6 +748,8 @@ static int fabriczc_mknod(struct mnt_idmap *idmap, struct inode *dir,
     raw->i_generation = 0;
     raw->i_indirect_block = FABRICZC_BLOCK_FREE;
     raw->i_double_indirect_block = FABRICZC_BLOCK_FREE;
+    raw->i_triple_indirect_block = FABRICZC_BLOCK_FREE;
+    raw->i_quad_indirect_block = FABRICZC_BLOCK_FREE;
     memset(raw->i_direct_blocks, 0xFF, sizeof(raw->i_direct_blocks));
     ret = fabriczc_inode_slot_write(sb, ino, raw);
     if (ret) { kfree(raw); goto err_slot; }
@@ -978,7 +991,7 @@ static struct file_system_type fabriczc_fs_type = {
     .fs_flags        = FS_REQUIRES_DEV,
 };
 
-/* Inode table is a fixed 32-block region; the slot index is the inode number. */
+/* Inode table is a fixed 1024-block region; the slot index is the inode number. */
 static u32 fabriczc_inode_slots(void)
 {
     return (FABRICZC_INODE_TABLE_BLOCKS * 4096) / (u32)sizeof(struct fabriczc_inode);

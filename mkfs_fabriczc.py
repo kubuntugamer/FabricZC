@@ -4,12 +4,12 @@
 import argparse, os, sys, struct, binascii, random
 
 # Floppy-style layout constants matching src/fs/fs_main.c & include/fabriczc_common.h
-FABRICZC_SB_MAGIC      = 0x465A4353 # "FZCS"
+FABRICZC_SB_MAGIC      = 0x465A4332 # "FZC2" (v2, 64-bit block pointers)
 FABRICZC_JOURNAL_MAGIC = 0x4A4E4C4D # "JNLM"
-FABRICZC_BLOCK_FREE    = 0xFFFFFFFF
+FABRICZC_BLOCK_FREE    = 0xFFFFFFFFFFFFFFFF
 FABRICZC_JOURNAL_BLOCK = 3
 FABRICZC_BITMAP_START  = 4
-FABRICZC_INODE_TABLE_BLOCKS = 32
+FABRICZC_INODE_TABLE_BLOCKS = 1024
 FABRICZC_BITS_PER_BLOCK = 4096 * 8
 FABRICZC_MIN_DISKS      = 1
 FABRICZC_MAX_DISKS      = 8
@@ -20,8 +20,8 @@ FABRICZC_NAME_LEN = 255
 # C standard alignment rules on 64-bit. (Verified by compiling a test.)
 
 def inode_size():
-    # sizeof(struct fabriczc_inode)
-    return 96
+    # sizeof(struct fabriczc_inode) -- v2 is padded to 256 so it divides 4096
+    return 256
 
 def inode_table_capacity(total_blocks):
     return FABRICZC_INODE_TABLE_BLOCKS * (4096 // inode_size())
@@ -59,24 +59,20 @@ def pack_journal():
     return buf
 
 def pack_inode_root():
-    buf = bytearray(512)
-    # mode: S_IFDIR | 0755
-    struct.pack_into('<H', buf, 0, 0x41ED)
+    buf = bytearray(inode_size())
+    struct.pack_into('<H', buf, 0, 0x41ED)                   # mode: S_IFDIR | 0755
     struct.pack_into('<H', buf, 2, 2)                        # i_links_count
     struct.pack_into('<I', buf, 4, 0)                        # i_uid
     struct.pack_into('<I', buf, 8, 0)                        # i_gid
     struct.pack_into('<Q', buf, 16, 4096)                    # i_size_bytes
     struct.pack_into('<Q', buf, 24, 8)                       # i_blocks_allocated
     struct.pack_into('<I', buf, 32, 0)                       # i_generation
+    struct.pack_into('<I', buf, 36, 0)                       # i_checksum
     for i in range(12):
-        struct.pack_into('<I', buf, 36 + i*4, FABRICZC_BLOCK_FREE)
-    # i_direct_blocks[0] points at block 0 (root dir)
-    struct.pack_into('<I', buf, 36 + 0*4, 0)
-    struct.pack_into('<I', buf, 84, FABRICZC_BLOCK_FREE)    # i_indirect_block
-    struct.pack_into('<I', buf, 88, 0)                       # i_checksum
-    # i_double_indirect_block occupies the struct's tail padding at 92;
-    # a zero there also reads as "unset" on images made by older mkfs builds.
-    struct.pack_into('<I', buf, 92, FABRICZC_BLOCK_FREE)     # i_double_indirect_block
+        struct.pack_into('<Q', buf, 40 + i*8, FABRICZC_BLOCK_FREE)
+    struct.pack_into('<Q', buf, 40, 0)                       # direct[0] -> root dir block 0
+    for off in (136, 144, 152, 160):                         # indirect..quad
+        struct.pack_into('<Q', buf, off, FABRICZC_BLOCK_FREE)
     return buf
 
 def main():

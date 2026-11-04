@@ -78,14 +78,24 @@ void fabriczc_refresh_disk_capacity(void)
         set_capacity(fabric_disk, bdev_nr_bytes(core_ctx.bdev) >> 9);
 }
 
+/*
+ * Tear the disk down exactly once. del_gendisk() -> bdi_unregister() ->
+ * device_del() -> klist_del() is not idempotent: a second call walks an
+ * already-unlinked klist node and dies in klist_put(). Clearing fabric_disk
+ * before the teardown makes re-entry (module exit after a partially failed
+ * unload) a no-op instead of a double delete.
+ */
 void fabriczc_unregister_block_layer(int major_num)
 {
-    if (fabric_disk) {
-        del_gendisk(fabric_disk);
-        put_disk(fabric_disk);
-        fabric_disk = NULL;
+    struct gendisk *disk = fabric_disk;
+
+    fabric_disk = NULL;
+    if (disk) {
+        del_gendisk(disk);
+        put_disk(disk);
     }
-    unregister_blkdev(major_num, "fabriczc");
+    if (major_num > 0)
+        unregister_blkdev(major_num, "fabriczc");
 }
 
 static void __maybe_unused fabric_bdev_anchor_vars(void) { (void)fabriczc_bdev_ops; }

@@ -228,7 +228,7 @@ static void fabriczc_free_blocks_add(struct super_block *sb, s64 delta)
 static int fabriczc_bitmap_test_set(struct super_block *sb, u64 blk, bool set)
 {
     struct buffer_head *bh;
-    u32 bitmap_block = FABRICZC_BITMAP_START + (u32)(blk / FABRICZC_BITS_PER_BLOCK);
+    u64 bitmap_block = FABRICZC_BITMAP_START + (blk / FABRICZC_BITS_PER_BLOCK);
     u32 bit = (u32)(blk % FABRICZC_BITS_PER_BLOCK);
     if (bitmap_block >= FABRICZC_BITMAP_START + fabriczc_bitmap_block_count(fabriczc_sb_total_blocks(sb)))
         return -ENOSPC;
@@ -244,20 +244,19 @@ static int fabriczc_bitmap_test_set(struct super_block *sb, u64 blk, bool set)
     return 0;
 }
 
-int fabriczc_alloc_data_block(struct super_block *sb, u32 *out_blk)
+int fabriczc_alloc_data_block(struct super_block *sb, u64 *out_blk)
 {
     u64 total = fabriczc_sb_total_blocks(sb);
     u64 first = fabriczc_data_start(total);
-    u32 bmp_blocks = fabriczc_bitmap_block_count(total);
-    u32 g;
+    u64 bmp_blocks = fabriczc_bitmap_block_count(total);
+    u64 g;
 
     if (unlikely(!out_blk)) return -EINVAL;
     for (g = 0; g < bmp_blocks; g++) {
         struct buffer_head *bh;
-        u32 bitmap_block = FABRICZC_BITMAP_START + g;
-        u64 group_base = (u64)g * FABRICZC_BITS_PER_BLOCK;
-        u64 scan = (g * (u64)FABRICZC_BITS_PER_BLOCK < first)
-                   ? (first - g * (u64)FABRICZC_BITS_PER_BLOCK) : 0;
+        u64 bitmap_block = FABRICZC_BITMAP_START + g;
+        u64 group_base = g * FABRICZC_BITS_PER_BLOCK;
+        u64 scan = (group_base < first) ? (first - group_base) : 0;
         u32 bit;
 
         bh = sb_bread(sb, bitmap_block);
@@ -270,7 +269,7 @@ int fabriczc_alloc_data_block(struct super_block *sb, u32 *out_blk)
                 sync_dirty_buffer(bh);
                 brelse(bh);
                 fabriczc_free_blocks_add(sb, -1);
-                *out_blk = (u32)(group_base + bit);
+                *out_blk = group_base + bit;
                 return 0;
             }
         }
@@ -279,7 +278,7 @@ int fabriczc_alloc_data_block(struct super_block *sb, u32 *out_blk)
     return -ENOSPC;
 }
 
-int fabriczc_free_data_block(struct super_block *sb, u32 blk)
+int fabriczc_free_data_block(struct super_block *sb, u64 blk)
 {
     int ret = fabriczc_bitmap_test_set(sb, blk, false);
 
@@ -343,16 +342,16 @@ int fabriczc_alloc_inode_slot(struct super_block *sb, u32 *out_ino)
  * A zero pointer is treated as "unset" because images created before
  * i_double_indirect_block existed carry a zero-filled tail.
  */
-static bool fabriczc_table_ptr_unset(u32 blk)
+static bool fabriczc_table_ptr_unset(u64 blk)
 {
     return blk == FABRICZC_BLOCK_FREE || blk == 0;
 }
 
 /* Allocate a 4 KiB index table and prefill it with FABRICZC_BLOCK_FREE */
-static int fabriczc_alloc_index_table(struct super_block *sb, u32 *out_blk)
+static int fabriczc_alloc_index_table(struct super_block *sb, u64 *out_blk)
 {
     char *zero;
-    u32 blk;
+    u64 blk;
     int i, ret;
 
     ret = fabriczc_alloc_data_block(sb, &blk);
@@ -361,7 +360,7 @@ static int fabriczc_alloc_index_table(struct super_block *sb, u32 *out_blk)
     zero = kzalloc(4096, GFP_KERNEL);
     if (!zero) { fabriczc_free_data_block(sb, blk); return -ENOMEM; }
     for (i = 0; i < FABRICZC_INDIRECT_ENTRIES; i++)
-        ((u32 *)zero)[i] = FABRICZC_BLOCK_FREE;
+        ((u64 *)zero)[i] = FABRICZC_BLOCK_FREE;
     ret = fabriczc_write_block(sb, blk, zero, 4096);
     kfree(zero);
     if (ret) { fabriczc_free_data_block(sb, blk); return ret; }
@@ -371,135 +370,103 @@ static int fabriczc_alloc_index_table(struct super_block *sb, u32 *out_blk)
 }
 
 /*
- * Double-indirect mapping: block i points at a table of single-indirect
- * tables, each covering FABRICZC_INDIRECT_ENTRIES further file blocks.
- * Raises the per-file ceiling from ~4 MiB to ~4 GiB.
+ * Walk one pointer-tree level. level == 1 means "slot holds a data block";
+ * level N means "slot holds a table of 512 level N-1 slots". Tables are only
+ * written back when something below them was allocated, so read lookups do
+ * no writes at all.
  */
-static int fabriczc_bmap_double_indirect(struct inode *inode, u32 iblock,
-                                         u32 *phys, bool create)
+static int fabriczc_bmap_walk(struct inode *inode, u32 level, u64 *slot,
+                              u64 iblock, u64 *phys, bool create, bool *changed)
 {
     struct super_block *sb = inode->i_sb;
     struct fabriczc_inode *raw = inode->i_private;
-    u32 dind_slot = iblock / FABRICZC_INDIRECT_ENTRIES;
-    u32 leaf_slot = iblock % FABRICZC_INDIRECT_ENTRIES;
-    u32 leaf_blk, data_blk;
-    char *table;
+    u64 per_branch = 1, blk;
+    u64 *table;
+    u32 idx, i;
     int ret;
 
-    if (unlikely(!sb || !raw)) return -EINVAL;
-    if (dind_slot >= FABRICZC_INDIRECT_ENTRIES) return -EFBIG;
+    if (level == 1) {
+        if (fabriczc_table_ptr_unset(*slot)) {
+            if (!create) { *phys = FABRICZC_BLOCK_FREE; return 0; }
+            ret = fabriczc_alloc_data_block(sb, &blk);
+            if (ret) return ret;
+            *slot = blk;
+            *changed = true;
+            raw->i_blocks_allocated += 8;
+            fabriczc_inode_slot_write(sb, inode->i_ino, raw);
+        }
+        *phys = *slot;
+        return 0;
+    }
 
-    if (fabriczc_table_ptr_unset(raw->i_double_indirect_block)) {
+    /* A level-2 entry points straight at a data block; each level above it
+     * fans out by another 512 entries, so an entry at level L covers
+     * 512^(L-2) data blocks. */
+    for (i = 2; i < level; i++)
+        per_branch *= FABRICZC_INDIRECT_ENTRIES;
+    idx = (u32)(iblock / per_branch);
+    if (idx >= FABRICZC_INDIRECT_ENTRIES) return -EFBIG;
+
+    if (fabriczc_table_ptr_unset(*slot)) {
         if (!create) { *phys = FABRICZC_BLOCK_FREE; return 0; }
-        ret = fabriczc_alloc_index_table(sb, &raw->i_double_indirect_block);
+        ret = fabriczc_alloc_index_table(sb, &blk);
         if (ret) return ret;
+        *slot = blk;
+        *changed = true;
         raw->i_blocks_allocated += 8;
         fabriczc_inode_slot_write(sb, inode->i_ino, raw);
     }
 
     table = kmalloc(4096, GFP_KERNEL);
     if (!table) return -ENOMEM;
-    ret = fabriczc_read_block(sb, raw->i_double_indirect_block, table, 4096);
+    ret = fabriczc_read_block(sb, *slot, table, 4096);
     if (ret) { kfree(table); return ret; }
-    leaf_blk = ((u32 *)table)[dind_slot];
-    if (fabriczc_table_ptr_unset(leaf_blk)) {
-        if (!create) { kfree(table); *phys = FABRICZC_BLOCK_FREE; return 0; }
-        ret = fabriczc_alloc_index_table(sb, &leaf_blk);
-        if (ret) { kfree(table); return ret; }
-        ((u32 *)table)[dind_slot] = leaf_blk;
-        ret = fabriczc_write_block(sb, raw->i_double_indirect_block, table, 4096);
-        if (ret) { kfree(table); return ret; }
-        raw->i_blocks_allocated += 8;
-        fabriczc_inode_slot_write(sb, inode->i_ino, raw);
-    }
-    kfree(table);
 
-    table = kmalloc(4096, GFP_KERNEL);
-    if (!table) return -ENOMEM;
-    ret = fabriczc_read_block(sb, leaf_blk, table, 4096);
-    if (ret) { kfree(table); return ret; }
-    data_blk = ((u32 *)table)[leaf_slot];
-    if (fabriczc_table_ptr_unset(data_blk)) {
-        if (!create) { kfree(table); *phys = FABRICZC_BLOCK_FREE; return 0; }
-        ret = fabriczc_alloc_data_block(sb, &data_blk);
-        if (ret) { kfree(table); return ret; }
-        ((u32 *)table)[leaf_slot] = data_blk;
-        ret = fabriczc_write_block(sb, leaf_blk, table, 4096);
-        if (ret) { kfree(table); return ret; }
-        raw->i_blocks_allocated += 8;
-        fabriczc_inode_slot_write(sb, inode->i_ino, raw);
-    }
-    *phys = data_blk;
+    ret = fabriczc_bmap_walk(inode, level - 1, &table[idx], iblock % per_branch,
+                             phys, create, changed);
+    if (!ret && *changed)
+        ret = fabriczc_write_block(sb, *slot, table, 4096);
     kfree(table);
-    return 0;
+    return ret;
 }
 
-int fabriczc_bmap_block(struct inode *inode, u32 iblock, u32 *phys, bool create)
+/*
+ * Map a file block. Direct slots cover 12 blocks; then 512, 512^2, 512^3 and
+ * 512^4 blocks through the four index levels, so the ceiling is ~256 TiB per
+ * file instead of the old 4 GiB, with 64-bit block numbers throughout.
+ */
+int fabriczc_bmap_block(struct inode *inode, u64 iblock, u64 *phys, bool create)
 {
-    struct super_block *sb = inode->i_sb;
     struct fabriczc_inode *raw = inode->i_private;
-    u32 phys_block;
-    int ret;
+    const u64 l1 = FABRICZC_INDIRECT_ENTRIES;
+    const u64 l2 = l1 * FABRICZC_INDIRECT_ENTRIES;
+    const u64 l3 = l2 * FABRICZC_INDIRECT_ENTRIES;
+    const u64 l4 = l3 * FABRICZC_INDIRECT_ENTRIES;
+    bool changed = false;
+    u64 idx = iblock;
 
     if (unlikely(!inode || !raw || !phys)) return -EINVAL;
-    if (iblock < FABRICZC_N_DIRECT_BLOCKS) {
-        if (raw->i_direct_blocks[iblock] == FABRICZC_BLOCK_FREE) {
-            if (!create) { *phys = FABRICZC_BLOCK_FREE; return 0; }
-            ret = fabriczc_alloc_data_block(sb, &phys_block);
-            if (ret) return ret;
-            raw->i_direct_blocks[iblock] = phys_block;
-            raw->i_blocks_allocated += 8;
-            fabriczc_inode_slot_write(sb, inode->i_ino, raw);
-        }
-        *phys = raw->i_direct_blocks[iblock];
-        return 0;
-    }
 
-    iblock -= FABRICZC_N_DIRECT_BLOCKS;
-    if (iblock >= FABRICZC_INDIRECT_ENTRIES)
-        return fabriczc_bmap_double_indirect(inode, iblock - FABRICZC_INDIRECT_ENTRIES,
-                                             phys, create);
-
-    if (raw->i_indirect_block == FABRICZC_BLOCK_FREE) {
-        u32 ind;
-        if (!create) { *phys = FABRICZC_BLOCK_FREE; return 0; }
-        ret = fabriczc_alloc_data_block(sb, &ind);
-        if (ret) return ret;
-        {
-            char *zero = kzalloc(4096, GFP_KERNEL);
-            u32 i;
-            if (!zero) { fabriczc_free_data_block(sb, ind); return -ENOMEM; }
-            for (i = 0; i < 1024; i++) ((u32 *)zero)[i] = FABRICZC_BLOCK_FREE;
-            ret = fabriczc_write_block(sb, ind, zero, 4096);
-            kfree(zero);
-            if (ret) { fabriczc_free_data_block(sb, ind); return ret; }
-        }
-        raw->i_indirect_block = ind;
-        raw->i_blocks_allocated += 8;
-        fabriczc_inode_slot_write(sb, inode->i_ino, raw);
-    }
-    {
-        char *ind = kmalloc(4096, GFP_KERNEL);
-        if (!ind) return -ENOMEM;
-        ret = fabriczc_read_block(sb, raw->i_indirect_block, ind, 4096);
-        if (ret) { kfree(ind); return ret; }
-        if (((u32 *)ind)[iblock] == FABRICZC_BLOCK_FREE) {
-            if (!create) { *phys = FABRICZC_BLOCK_FREE; kfree(ind); return 0; }
-            ret = fabriczc_alloc_data_block(sb, &phys_block);
-            if (ret) { kfree(ind); return ret; }
-            ((u32 *)ind)[iblock] = phys_block;
-            raw->i_blocks_allocated += 8;
-            fabriczc_inode_slot_write(sb, inode->i_ino, raw);
-            ret = fabriczc_write_block(sb, raw->i_indirect_block, ind, 4096);
-            kfree(ind);
-            if (ret) return ret;
-            *phys = phys_block;
-            return 0;
-        }
-        *phys = ((u32 *)ind)[iblock];
-        kfree(ind);
-        return 0;
-    }
+    if (idx < FABRICZC_N_DIRECT_BLOCKS)
+        return fabriczc_bmap_walk(inode, 1, &raw->i_direct_blocks[idx], 0,
+                                  phys, create, &changed);
+    idx -= FABRICZC_N_DIRECT_BLOCKS;
+    if (idx < l1)
+        return fabriczc_bmap_walk(inode, 2, &raw->i_indirect_block, idx,
+                                  phys, create, &changed);
+    idx -= l1;
+    if (idx < l2)
+        return fabriczc_bmap_walk(inode, 3, &raw->i_double_indirect_block, idx,
+                                  phys, create, &changed);
+    idx -= l2;
+    if (idx < l3)
+        return fabriczc_bmap_walk(inode, 4, &raw->i_triple_indirect_block, idx,
+                                  phys, create, &changed);
+    idx -= l3;
+    if (idx < l4)
+        return fabriczc_bmap_walk(inode, 5, &raw->i_quad_indirect_block, idx,
+                                  phys, create, &changed);
+    return -EFBIG;
 }
 
 /*
@@ -510,15 +477,15 @@ int fabriczc_bmap_block(struct inode *inode, u32 iblock, u32 *phys, bool create)
  */
 int fabriczc_get_block(struct inode *inode, sector_t iblock, struct buffer_head *bh_result, int create)
 {
-    u32 phys;
-    int ret = fabriczc_bmap_block(inode, (u32)iblock, &phys, create != 0);
+    u64 phys;
+    int ret = fabriczc_bmap_block(inode, (u64)iblock, &phys, create != 0);
     if (ret) return ret;
     if (phys == FABRICZC_BLOCK_FREE) return 0;
     map_bh(bh_result, inode->i_sb, (sector_t)phys << (inode->i_sb->s_blocksize_bits - 9));
     return 0;
 }
 
-int fabriczc_read_block(struct super_block *sb, u32 block, void *buf, u32 len)
+int fabriczc_read_block(struct super_block *sb, u64 block, void *buf, u32 len)
 {
     u64 pos = (u64)block * 4096;
     struct fabriczc_runtime_context *ctx = fabriczc_get_runtime_ctx();
@@ -527,7 +494,7 @@ int fabriczc_read_block(struct super_block *sb, u32 block, void *buf, u32 len)
     return 0;
 }
 
-int fabriczc_write_block(struct super_block *sb, u32 block, const void *buf, u32 len)
+int fabriczc_write_block(struct super_block *sb, u64 block, const void *buf, u32 len)
 {
     u64 pos = (u64)block * 4096;
     struct fabriczc_runtime_context *ctx = fabriczc_get_runtime_ctx();

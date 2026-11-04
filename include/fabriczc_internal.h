@@ -133,11 +133,11 @@ int fabriczc_expose_disk(void);
 void fabriczc_refresh_disk_capacity(void);
 
 /* Allocation and inode-slot helpers implemented in src/fs/metadata_io.c */
-int fabriczc_alloc_data_block(struct super_block *sb, u32 *out_blk);
-int fabriczc_free_data_block(struct super_block *sb, u32 blk);
+int fabriczc_alloc_data_block(struct super_block *sb, u64 *out_blk);
+int fabriczc_free_data_block(struct super_block *sb, u64 blk);
 int fabriczc_alloc_inode_slot(struct super_block *sb, u32 *out_ino);
 int fabriczc_inode_slot_read(struct super_block *sb, u32 ino, struct fabriczc_inode *raw);
 int fabriczc_inode_slot_write(struct super_block *sb, u32 ino, const struct fabriczc_inode *raw);
-int fabriczc_bmap_block(struct inode *inode, u32 iblock, u32 *phys, bool create);
-int fabriczc_read_block(struct super_block *sb, u32 block, void *buf, u32 len);
-int fabriczc_write_block(struct super_block *sb, u32 block, const void *buf, u32 len);
+int fabriczc_bmap_block(struct inode *inode, u64 iblock, u64 *phys, bool create);
+int fabriczc_read_block(struct super_block *sb, u64 block, void *buf, u32 len);
+int fabriczc_write_block(struct super_block *sb, u64 block, const void *buf, u32 len);

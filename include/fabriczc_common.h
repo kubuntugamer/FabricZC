@@ -32,7 +32,7 @@ struct fabriczc_array_metadata {
     u32 checksum;            /* Structural integrity validation check */
 };
 
-#define FABRICZC_SB_MAGIC       0x465A4353  /* "FZCS" Superblock Magic */
+#define FABRICZC_SB_MAGIC       0x465A4332  /* "FZC2" Superblock Magic (v2, 64-bit pointers) */
 #define FABRICZC_STATE_CLEAN    0x00000001
 #define FABRICZC_STATE_DIRTY    0x00000002
 
@@ -60,11 +60,17 @@ struct fabriczc_block_group_desc {
 };
 
 #define FABRICZC_N_DIRECT_BLOCKS 12
-#define FABRICZC_INDIRECT_ENTRIES 1024 /* u32 pointers per 4 KiB index table */
+#define FABRICZC_INDIRECT_ENTRIES 512 /* u64 pointers per 4 KiB index table */
 #define FABRICZC_FT_REG_FILE     1
 #define FABRICZC_FT_DIR          2
 
-/* Master on-disk storage layout representation for file nodes */
+/*
+ * v2 on-disk inode: 64-bit block pointers throughout, so one pointer addresses
+ * the whole device instead of the old 16 TiB / 4 GiB truncation. The struct is
+ * padded to 256 bytes, which divides 4096 evenly, so a slot can never straddle
+ * two table blocks. Four indirection levels reach 512^4 blocks (~256 TiB) per
+ * file. Slot 0 is reserved; the root is slot 1.
+ */
 struct fabriczc_inode {
     u16 i_mode;               /* Standard type and permission access bitmask flags */
     u16 i_links_count;        /* Total tracking directory hard-link references */
@@ -73,12 +79,13 @@ struct fabriczc_inode {
     u64 i_size_bytes;         /* Complete structural file capacity payload depth in bytes */
     u64 i_blocks_allocated;   /* Count of assigned 512-byte structural sectors */
     u32 i_generation;         /* Volume file modification generation tracking index */
-    u32 i_direct_blocks[FABRICZC_N_DIRECT_BLOCKS]; /* Map pointers to direct 4KB clusters */
-    u32 i_indirect_block;     /* Map pointer targeting a secondary single-indirect index table */
     u32 i_checksum;           /* Individual item structure integrity verification signature */
-    u32 i_double_indirect_block; /* Map pointer to a double-indirect table. Lives in the
-                                  * struct's existing tail padding, so sizeof stays 96 and
-                                  * older images remain readable (a zero tail reads as unset). */
+    u64 i_direct_blocks[FABRICZC_N_DIRECT_BLOCKS]; /* Direct 4 KiB data clusters */
+    u64 i_indirect_block;     /* Level 1 index table */
+    u64 i_double_indirect_block; /* Level 2 index table */
+    u64 i_triple_indirect_block; /* Level 3 index table */
+    u64 i_quad_indirect_block;   /* Level 4 index table */
+    u8  i_reserved[88];       /* Pad to 256 bytes */
 };
 
 #define FABRICZC_NAME_LEN 255
@@ -100,15 +107,15 @@ struct fabriczc_dir_entry {
  *   block FABRICZC_SB_BLOCK: superblock
  *   block FABRICZC_JOURNAL_BLOCK: journal header
  *   blocks [4, 4+bmp)      : free-block bitmap (1 bit per 4 KiB block)
- *   blocks [itis, itis+32) : inode table (slot index == inode number)
+ *   blocks [itis, itis+1024): inode table (slot index == inode number)
  *   rest                   : file data
  * Free direct-block slots inside an inode are marked FABRICZC_BLOCK_FREE.
  */
-#define FABRICZC_BLOCK_FREE  0xFFFFFFFFu
+#define FABRICZC_BLOCK_FREE  0xFFFFFFFFFFFFFFFFULL
 #define FABRICZC_SB_BLOCK    2u
 #define FABRICZC_JOURNAL_BLOCK 3u
 #define FABRICZC_BITMAP_START  4u
-#define FABRICZC_INODE_TABLE_BLOCKS 32u
+#define FABRICZC_INODE_TABLE_BLOCKS 1024u /* 256 KiB table == 16,384 slots */
 
 static inline u32 fabriczc_bitmap_block_count(u64 total_blocks)
 {
