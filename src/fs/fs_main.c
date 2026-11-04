@@ -978,6 +978,33 @@ static struct file_system_type fabriczc_fs_type = {
     .fs_flags        = FS_REQUIRES_DEV,
 };
 
+/* Inode table is a fixed 32-block region; the slot index is the inode number. */
+static u32 fabriczc_inode_slots(void)
+{
+    return (FABRICZC_INODE_TABLE_BLOCKS * 4096) / (u32)sizeof(struct fabriczc_inode);
+}
+
+/*
+ * A slot is free when i_mode is 0, which is exactly what the slot allocator
+ * reuses. Bounded by the 128 KiB inode table, independent of device size.
+ */
+static u64 fabriczc_count_free_inode_slots(struct super_block *sb)
+{
+    struct fabriczc_inode *raw;
+    u32 slots = fabriczc_inode_slots();
+    u64 free = 0;
+    u32 i;
+
+    raw = kmalloc(sizeof(*raw), GFP_KERNEL);
+    if (!raw) return 0;
+    for (i = 1; i < slots; i++) {
+        if (fabriczc_inode_slot_read(sb, i, raw)) break;
+        if (raw->i_mode == 0) free++;
+    }
+    kfree(raw);
+    return free;
+}
+
 /*
  * O(1): reports the live count maintained by the allocation paths. Counting
  * free bits by reading every bitmap block meant ~119k block reads (476 MB) on
@@ -997,7 +1024,8 @@ static int fabriczc_statfs(struct dentry *dentry, struct kstatfs *buf)
     if (!sb || !sb->s_bdev) return -ENODEV;
     total = bdev_nr_bytes(sb->s_bdev) >> 12;
     buf->f_blocks = total;
-    buf->f_files = total;
+    buf->f_files = fabriczc_inode_slots() - 1; /* slot 0 is reserved */
+    buf->f_ffree = fabriczc_count_free_inode_slots(sb);
 
     sbi = (struct fabriczc_sb_info *)sb->s_fs_info;
     if (sbi) {
@@ -1012,50 +1040,78 @@ static int fabriczc_statfs(struct dentry *dentry, struct kstatfs *buf)
     return 0;
 }
 
+static int fabriczc_sync_fs(struct super_block *sb, int wait);
+
 static const struct super_operations fabriczc_super_ops = {
     .evict_inode    = fabriczc_evict_inode,
     .put_super      = fabriczc_put_super,
+    .sync_fs        = fabriczc_sync_fs,
     .statfs         = fabriczc_statfs,
 };
+
+/*
+ * Persist the live free-block count so the next mount can report it without
+ * rescanning the bitmap; the bitmap stays authoritative for allocation.
+ *
+ * The superblock lives on the target device, not on the synthetic
+ * /dev/fabriczc0 that sb->s_bdev points at, so it is read and written with the
+ * raw metadata helpers. sb_bread() here silently wrote to the wrong device and
+ * the count never reached the array.
+ */
+static int fabriczc_persist_free_blocks(struct super_block *sb)
+{
+    struct fabriczc_sb_info *sbi = sb ? (struct fabriczc_sb_info *)sb->s_fs_info : NULL;
+    struct fabriczc_superblock *sbk;
+    struct fabriczc_runtime_context *ctx;
+    char *buf;
+    int ret = 0;
+
+    if (!sbi) return 0;
+
+    buf = kmalloc(4096, GFP_KERNEL);
+    if (!buf) return -ENOMEM;
+
+    if (fabriczc_read_block(sb, FABRICZC_SB_BLOCK, buf, 4096) == 0) {
+        unsigned long flags;
+
+        sbk = (struct fabriczc_superblock *)buf;
+        spin_lock_irqsave(&sbi->free_lock, flags);
+        sbk->free_blocks = sbi->free_blocks;
+        spin_unlock_irqrestore(&sbi->free_lock, flags);
+
+        ret = fabriczc_write_block(sb, FABRICZC_SB_BLOCK, buf, 4096);
+        if (!ret) {
+            ctx = fabriczc_get_runtime_ctx();
+            if (ctx && ctx->bdev)
+                sync_blockdev(ctx->bdev);
+        }
+    } else {
+        ret = -EIO;
+    }
+
+    kfree(buf);
+    return ret;
+}
+
+/* sync(2)/syncfs() persist the counter too, not just unmount. */
+static int fabriczc_sync_fs(struct super_block *sb, int wait)
+{
+    (void)wait;
+    return fabriczc_persist_free_blocks(sb);
+}
 
 /*
  * generic_shutdown_super() already runs sync_filesystem() before ->put_super,
  * so a second sync here is redundant. Metadata buffers are flushed
  * synchronously (sync_dirty_buffer) when they are written.
- *
- * Persist the live free-block count so the next mount can report it without
- * rescanning the bitmap; the bitmap stays authoritative for allocation.
  */
 void fabriczc_put_super(struct super_block *sb)
 {
     struct fabriczc_sb_info *sbi = sb ? (struct fabriczc_sb_info *)sb->s_fs_info : NULL;
-    char *buf;
 
     if (!sbi) return;
 
-    /*
-     * The superblock lives on the target device, not on the synthetic
-     * /dev/fabriczc0 that sb->s_bdev points at, so it is read and written with
-     * the raw metadata helpers. sb_bread() here silently wrote to the wrong
-     * device and the count never reached the array.
-     */
-    buf = kmalloc(4096, GFP_KERNEL);
-    if (buf && fabriczc_read_block(sb, FABRICZC_SB_BLOCK, buf, 4096) == 0) {
-        struct fabriczc_superblock *sbk = (struct fabriczc_superblock *)buf;
-        struct fabriczc_runtime_context *ctx;
-        unsigned long flags;
-
-        spin_lock_irqsave(&sbi->free_lock, flags);
-        sbk->free_blocks = sbi->free_blocks;
-        spin_unlock_irqrestore(&sbi->free_lock, flags);
-
-        if (fabriczc_write_block(sb, FABRICZC_SB_BLOCK, buf, 4096) == 0) {
-            ctx = fabriczc_get_runtime_ctx();
-            if (ctx && ctx->bdev)
-                sync_blockdev(ctx->bdev);
-        }
-    }
-    kfree(buf);
+    fabriczc_persist_free_blocks(sb);
 
     kfree(sbi);
     sb->s_fs_info = NULL;
