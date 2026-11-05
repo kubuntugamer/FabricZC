@@ -8,6 +8,7 @@
 #include <linux/fs.h>
 #include <linux/bio.h>
 #include <linux/buffer_head.h>
+#include <linux/completion.h>
 #include <linux/spinlock.h>
 #include <fabriczc_common.h>
 
@@ -119,7 +120,14 @@ struct fabriczc_sb_info {
     struct mutex alloc_mutex; /* serialises bitmap claim/release */
     u32 inode_hint;           /* inode slot to start the next scan at */
     u64 free_inodes;          /* live free-slot count, mirrored to the superblock */
+    u64 reserve_start;        /* first block of the live allocation window */
+    u32 reserve_count;        /* blocks left in that window */
 };
+
+/* Blocks claimed from the bitmap per refill, and blocks per pipelined write. */
+#define FABRICZC_ALLOC_BATCH 512
+#define FABRICZC_WRITE_BATCH 64
+#define FABRICZC_READAHEAD_BATCH 32
 
 int fabriczc_fs_init(void);
 void fabriczc_fs_exit(void);
@@ -142,6 +150,51 @@ int fabriczc_inode_slot_write(struct super_block *sb, u32 ino, const struct fabr
 int fabriczc_bmap_block(struct inode *inode, u64 iblock, u64 *phys, bool create);
 int fabriczc_read_block(struct super_block *sb, u64 block, void *buf, u32 len);
 int fabriczc_write_block(struct super_block *sb, u64 block, const void *buf, u32 len);
+int fabriczc_inode_slot_write_deferred(struct super_block *sb, u32 ino,
+                                       const struct fabriczc_inode *raw);
+void fabriczc_drop_reservation(struct super_block *sb);
+
+/*
+ * File data I/O. Data blocks move as whole contiguous runs in one block request
+ * and never enter the buffer cache; metadata (superblock, bitmaps, inode slots,
+ * directories) still goes through buffer heads. One synchronous 4 KiB write per
+ * data block capped the array at 264 MB/s where a 1 MiB request reaches 4.4 GB/s.
+ */
+#define FABRICZC_IO_MAX_BLOCKS 256  /* blocks per request: 1 MiB */
+#define FABRICZC_IO_DEPTH 4         /* bounce-buffered writes kept in flight */
+
+int fabriczc_read_blocks(struct super_block *sb, u64 block, void *buf, u32 nblocks);
+int fabriczc_write_blocks(struct super_block *sb, u64 block, const void *buf,
+                          u32 nblocks);
+int fabriczc_read_folios(struct super_block *sb, u64 block, struct folio **folios,
+                         unsigned int n);
+int fabriczc_write_folios(struct super_block *sb, u64 block, struct folio **folios,
+                          unsigned int n, struct address_space *mapping);
+
+struct buffer_head *fabriczc_write_block_submit(struct super_block *sb, u64 block,
+                                                const void *buf, u32 len);
+int fabriczc_write_block_wait(struct buffer_head *bh);
+
+/*
+ * Sequential writer: hands out a slot buffer, submits it as an asynchronous
+ * request, and only waits when that slot comes round again. Keeps several
+ * requests on the device instead of paying a round trip per megabyte.
+ */
+struct fabriczc_io_pipe {
+    struct completion done[FABRICZC_IO_DEPTH];
+    struct bio *bio[FABRICZC_IO_DEPTH];
+    struct super_block *sb;
+    char *buf;
+    unsigned int slot;
+    int error;
+};
+
+int fabriczc_io_pipe_init(struct fabriczc_io_pipe *pipe, struct super_block *sb);
+void fabriczc_io_pipe_exit(struct fabriczc_io_pipe *pipe);
+char *fabriczc_io_pipe_acquire(struct fabriczc_io_pipe *pipe);
+int fabriczc_io_pipe_submit(struct fabriczc_io_pipe *pipe, u64 block,
+                            unsigned int nblocks);
+int fabriczc_io_pipe_drain(struct fabriczc_io_pipe *pipe);
 
 /* Free the data and index blocks of `inode` at or above `newsize`. */
 int fabriczc_truncate_blocks(struct inode *inode, u64 newsize);

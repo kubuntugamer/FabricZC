@@ -6,6 +6,8 @@
 #include <linux/bio.h>
 #include <linux/buffer_head.h>
 #include <linux/slab.h>
+#include <linux/vmalloc.h>
+#include <linux/pagemap.h>
 #include <linux/jiffies.h>
 #include <fabriczc_internal.h>
 #include <fabriczc_common.h>
@@ -172,12 +174,20 @@ static int fabriczc_bitmap_test_set(struct super_block *sb, u64 blk, bool set)
 }
 
 /*
- * Scan [from, to) of the allocation bitmap and claim the first free bit.
+ * Scan [from, to) of the allocation bitmap for up to `max_blocks` free bits in
+ * a row and claim them with a single bitmap write.
+ *
+ * Claiming one block per bitmap update meant every 4 KiB of file data cost a
+ * read plus a synchronous write of the bitmap block, which is what held the
+ * array to 63 MB/s. A run of 512 blocks amortises that over 2 MiB of data and
+ * has the side effect of handing the data path physically contiguous blocks to
+ * write in one request.
+ *
  * The caller holds sbi->alloc_mutex across the test-and-set, so two writers
  * cannot be handed the same block.
  */
-static int fabriczc_claim_bitmap_range(struct super_block *sb, u64 from, u64 to,
-                                       u64 *out_blk)
+static int fabriczc_claim_bitmap_run(struct super_block *sb, u64 from, u64 to,
+                                     u32 max_blocks, u64 *out_blk, u32 *out_count)
 {
     u64 total = fabriczc_sb_total_blocks(sb);
     u64 cur = from;
@@ -186,26 +196,76 @@ static int fabriczc_claim_bitmap_range(struct super_block *sb, u64 from, u64 to,
     while (cur < to) {
         u64 group = cur / FABRICZC_BITS_PER_BLOCK;
         u64 group_base = group * FABRICZC_BITS_PER_BLOCK;
+        u64 group_end = group_base + FABRICZC_BITS_PER_BLOCK;
         u32 bit = (u32)(cur - group_base);
+        u64 run_start = 0;
+        u32 run = 0;
         struct buffer_head *bh;
 
+        if (group_end > to) group_end = to;
         bh = sb_bread(sb, FABRICZC_BITMAP_START + group);
         if (!bh) return -EIO;
         for (; bit < FABRICZC_BITS_PER_BLOCK; bit++) {
-            if (group_base + bit >= to) break;
-            if (!test_bit(bit, (unsigned long *)bh->b_data)) {
-                set_bit(bit, (unsigned long *)bh->b_data);
-                mark_buffer_dirty(bh);
-                sync_dirty_buffer(bh);
-                *out_blk = group_base + bit;
-                brelse(bh);
-                return 0;
+            u64 blk = group_base + bit;
+
+            if (blk >= group_end) break;
+            if (test_bit(bit, (unsigned long *)bh->b_data)) {
+                if (run) break; /* the free run ended here */
+                continue;
             }
+            if (!run) run_start = blk;
+            if (++run >= max_blocks) break;
+        }
+        if (run) {
+            u32 i;
+
+            for (i = 0; i < run; i++)
+                set_bit((u32)(run_start - group_base) + i,
+                        (unsigned long *)bh->b_data);
+            mark_buffer_dirty(bh);
+            sync_dirty_buffer(bh);
+            brelse(bh);
+            *out_blk = run_start;
+            *out_count = run;
+            return 0;
         }
         brelse(bh);
-        cur = group_base + FABRICZC_BITS_PER_BLOCK;
+        cur = group_end;
     }
     return -ENOSPC;
+}
+
+/*
+ * Blocks claimed but not yet handed out stay marked used in the bitmap, so a
+ * mount that finishes with a partly used window would leak them. Give them
+ * back before the last sync: free_blocks never counted them.
+ */
+void fabriczc_drop_reservation(struct super_block *sb)
+{
+    struct fabriczc_sb_info *sbi = sb ? (struct fabriczc_sb_info *)sb->s_fs_info : NULL;
+    u64 blk;
+
+    if (!sbi) return;
+    mutex_lock(&sbi->alloc_mutex);
+    blk = sbi->reserve_start;
+    while (sbi->reserve_count) {
+        u64 group = blk / FABRICZC_BITS_PER_BLOCK;
+        u64 group_base = group * FABRICZC_BITS_PER_BLOCK;
+        u32 bit = (u32)(blk - group_base);
+        struct buffer_head *bh;
+
+        bh = sb_bread(sb, FABRICZC_BITMAP_START + group);
+        if (!bh) break;
+        for (; bit < FABRICZC_BITS_PER_BLOCK && sbi->reserve_count;
+             bit++, blk++, sbi->reserve_count--)
+            clear_bit(bit, (unsigned long *)bh->b_data);
+        mark_buffer_dirty(bh);
+        sync_dirty_buffer(bh);
+        brelse(bh);
+    }
+    sbi->reserve_start = 0;
+    sbi->reserve_count = 0;
+    mutex_unlock(&sbi->alloc_mutex);
 }
 
 /*
@@ -218,7 +278,7 @@ int fabriczc_alloc_data_block(struct super_block *sb, u64 *out_blk)
 {
     struct fabriczc_sb_info *sbi = sb ? (struct fabriczc_sb_info *)sb->s_fs_info : NULL;
     u64 total, first, start;
-    int ret;
+    int ret = 0;
 
     if (unlikely(!out_blk || !sbi)) return -EINVAL;
 
@@ -227,18 +287,30 @@ int fabriczc_alloc_data_block(struct super_block *sb, u64 *out_blk)
     if (first >= total) return -ENOSPC;
 
     mutex_lock(&sbi->alloc_mutex);
-    start = sbi->alloc_hint;
-    if (start < first || start >= total) start = first;
+    if (!sbi->reserve_count) {
+        u32 count = 0;
 
-    ret = fabriczc_claim_bitmap_range(sb, start, total, out_blk);
-    if (ret == -ENOSPC && start > first)
-        ret = fabriczc_claim_bitmap_range(sb, first, start, out_blk);
-    if (!ret) {
-        sbi->alloc_hint = *out_blk + 1;
-        fabriczc_free_blocks_add(sb, -1);
+        start = sbi->alloc_hint;
+        if (start < first || start >= total) start = first;
+
+        ret = fabriczc_claim_bitmap_run(sb, start, total, FABRICZC_ALLOC_BATCH,
+                                        &sbi->reserve_start, &count);
+        if (ret == -ENOSPC && start > first)
+            ret = fabriczc_claim_bitmap_run(sb, first, start,
+                                            FABRICZC_ALLOC_BATCH,
+                                            &sbi->reserve_start, &count);
+        if (ret) {
+            mutex_unlock(&sbi->alloc_mutex);
+            return ret;
+        }
+        sbi->reserve_count = count;
     }
+    *out_blk = sbi->reserve_start++;
+    sbi->reserve_count--;
+    sbi->alloc_hint = sbi->reserve_start;
+    fabriczc_free_blocks_add(sb, -1);
     mutex_unlock(&sbi->alloc_mutex);
-    return ret;
+    return 0;
 }
 
 int fabriczc_free_data_block(struct super_block *sb, u64 blk)
@@ -422,6 +494,35 @@ int fabriczc_inode_slot_write(struct super_block *sb, u32 ino, const struct fabr
 }
 
 /*
+ * Same slot update without the device round trip. Allocation uses this: the
+ * inode is rewritten once per block mapped, and waiting for that write for
+ * every 4 KiB halved the write throughput on its own. The block stays dirty in
+ * the buffer cache and is flushed by the run sync, fsync() or unmount.
+ */
+int fabriczc_inode_slot_write_deferred(struct super_block *sb, u32 ino,
+                                       const struct fabriczc_inode *raw)
+{
+    u64 total = fabriczc_sb_total_blocks(sb);
+    u32 table_block = fabriczc_inode_table_start(total) +
+                      (u32)(((u64)ino * sizeof(*raw)) / 4096);
+    u32 off = (u32)(((u64)ino * sizeof(*raw)) % 4096);
+    struct buffer_head *bh = sb_getblk(sb, table_block);
+    if (!bh) return -ENOMEM;
+    if (!buffer_uptodate(bh)) {
+        /* Never read this block: only the target slot matters to the caller,
+         * but leaving the rest of the table uninitialised on disk would clobber
+         * neighbouring inodes, so read it in. */
+        brelse(bh);
+        bh = sb_bread(sb, table_block);
+        if (!bh) return -EIO;
+    }
+    memcpy(bh->b_data + off, raw, sizeof(*raw));
+    mark_buffer_dirty(bh);
+    brelse(bh);
+    return 0;
+}
+
+/*
  * Find a free inode slot starting at the cursor, scanning a whole table block
  * (16 slots) at a time. Slots are u32 and the table can hold millions, so a
  * restart-from-slot-1 scan would make every create progressively slower.
@@ -525,7 +626,7 @@ static int fabriczc_bmap_walk(struct inode *inode, u32 level, u64 *slot,
             *slot = blk;
             *changed = true;
             raw->i_blocks_allocated += 8;
-            fabriczc_inode_slot_write(sb, inode->i_ino, raw);
+            fabriczc_inode_slot_write_deferred(sb, inode->i_ino, raw);
         }
         *phys = *slot;
         return 0;
@@ -546,7 +647,7 @@ static int fabriczc_bmap_walk(struct inode *inode, u32 level, u64 *slot,
         *slot = blk;
         *changed = true;
         raw->i_blocks_allocated += 8;
-        fabriczc_inode_slot_write(sb, inode->i_ino, raw);
+        fabriczc_inode_slot_write_deferred(sb, inode->i_ino, raw);
     }
 
     table = kmalloc(4096, GFP_KERNEL);
@@ -556,8 +657,19 @@ static int fabriczc_bmap_walk(struct inode *inode, u32 level, u64 *slot,
 
     ret = fabriczc_bmap_walk(inode, level - 1, &table[idx], iblock % per_branch,
                              phys, create, changed);
-    if (!ret && *changed)
-        ret = fabriczc_write_block(sb, *slot, table, 4096);
+    if (!ret && *changed) {
+        /* Deferred: this table is rewritten once per newly mapped block, and a
+         * device round trip here dominated sequential writes. */
+        struct buffer_head *bh = sb_getblk(sb, *slot);
+
+        if (!bh) ret = -ENOMEM;
+        else {
+            memcpy(bh->b_data, table, 4096);
+            set_buffer_uptodate(bh);
+            mark_buffer_dirty(bh);
+            brelse(bh);
+        }
+    }
     kfree(table);
     return ret;
 }
@@ -657,6 +769,277 @@ int fabriczc_write_block(struct super_block *sb, u64 block, const void *buf, u32
     ret = sync_dirty_buffer(bh);
     brelse(bh);
     return ret;
+}
+
+/*
+ * Start a block write and return immediately, holding one reference on the
+ * buffer head. Reaping happens in fabriczc_write_block_wait(). A sequential
+ * write of 4 KiB blocks through sync_dirty_buffer() serialises every request on
+ * the device; this keeps a run of them in flight instead.
+ */
+struct buffer_head *fabriczc_write_block_submit(struct super_block *sb, u64 block,
+                                               const void *buf, u32 len)
+{
+    struct buffer_head *bh;
+
+    if (unlikely(!sb || !sb->s_bdev || !buf || len > sb->s_blocksize))
+        return ERR_PTR(-EINVAL);
+
+    bh = sb_getblk(sb, (sector_t)block);
+    if (!bh) return ERR_PTR(-ENOMEM);
+    memcpy(bh->b_data, buf, len);
+    set_buffer_uptodate(bh);
+    mark_buffer_dirty(bh);
+    write_dirty_buffer(bh, REQ_SYNC);
+    return bh;
+}
+
+int fabriczc_write_block_wait(struct buffer_head *bh)
+{
+    int ret = 0;
+
+    if (unlikely(!bh)) return -EINVAL;
+    if (IS_ERR(bh)) return (int)PTR_ERR(bh);
+    wait_on_buffer(bh);
+    if (unlikely(!buffer_uptodate(bh))) ret = -EIO;
+    brelse(bh);
+    return ret;
+}
+
+/* --- File data I/O ----------------------------------------------------
+ *
+ * Data blocks are read and written as whole contiguous runs in a single block
+ * request. The previous one-buffer-head-per-4-KiB-block scheme issued one 4 KiB
+ * request at a time and measured 264 MB/s on an array that does 4.4 GB/s with
+ * 1 MiB requests. Data never enters the buffer cache on this path, so a data
+ * block can only ever be in the page cache (reads) or on the medium.
+ */
+
+static unsigned int fabriczc_page_span(struct super_block *sb)
+{
+    /* Buffer helpers assume block size == page size (the format is fixed at
+     * 4 KiB); anything else would need partial-page bounce handling. */
+    return sb->s_blocksize == PAGE_SIZE ? 1 : 0;
+}
+
+static int fabriczc_bio_rw_buffer(struct super_block *sb, u64 block, void *buf,
+                                  u32 nblocks, bool write)
+{
+    struct page **pages;
+    struct bio *bio;
+    u32 i;
+    int ret = 0;
+
+    if (unlikely(!sb || !sb->s_bdev || !buf || !nblocks || !fabriczc_page_span(sb)))
+        return -EINVAL;
+
+    if (nblocks == 1) {
+        pages = NULL;
+    } else {
+        pages = kvmalloc_array(nblocks, sizeof(*pages), GFP_NOFS);
+        if (!pages) return -ENOMEM;
+        for (i = 0; i < nblocks; i++) {
+            void *addr = (char *)buf + ((size_t)i << PAGE_SHIFT);
+
+            pages[i] = is_vmalloc_addr(addr) ? vmalloc_to_page(addr)
+                                            : virt_to_page(addr);
+            if (!pages[i]) { ret = -EFAULT; goto out; }
+        }
+    }
+
+    bio = bio_alloc(sb->s_bdev, (unsigned short)nblocks,
+                    write ? (REQ_OP_WRITE | REQ_SYNC) : REQ_OP_READ, GFP_NOFS);
+    if (!bio) { ret = -ENOMEM; goto out; }
+    bio->bi_iter.bi_sector = (sector_t)block << (sb->s_blocksize_bits - 9);
+    for (i = 0; i < nblocks; i++) {
+        struct page *pg = pages ? pages[i] : virt_to_page((char *)buf + ((size_t)i << PAGE_SHIFT));
+
+        if (bio_add_page(bio, pg, PAGE_SIZE, 0) != PAGE_SIZE) { ret = -EIO; break; }
+    }
+    if (!ret) ret = submit_bio_wait(bio);
+    bio_put(bio);
+out:
+    kvfree(pages);
+    return ret;
+}
+
+int fabriczc_read_blocks(struct super_block *sb, u64 block, void *buf, u32 nblocks)
+{
+    return fabriczc_bio_rw_buffer(sb, block, buf, nblocks, false);
+}
+
+int fabriczc_write_blocks(struct super_block *sb, u64 block, const void *buf,
+                          u32 nblocks)
+{
+    return fabriczc_bio_rw_buffer(sb, block, (void *)buf, nblocks, true);
+}
+
+/* Fill n folios straight from n contiguous blocks: no bounce copy. */
+int fabriczc_read_folios(struct super_block *sb, u64 block, struct folio **folios,
+                         unsigned int n)
+{
+    struct bio *bio;
+    unsigned int i;
+    int ret = 0;
+
+    if (unlikely(!sb || !sb->s_bdev || !folios || !n || n > FABRICZC_IO_MAX_BLOCKS))
+        return -EINVAL;
+
+    bio = bio_alloc(sb->s_bdev, (unsigned short)n, REQ_OP_READ, GFP_NOFS);
+    if (!bio) return -ENOMEM;
+    bio->bi_iter.bi_sector = (sector_t)block << (sb->s_blocksize_bits - 9);
+    for (i = 0; i < n; i++) {
+        if (bio_add_page(bio, folio_page(folios[i], 0), PAGE_SIZE, 0) != PAGE_SIZE) {
+            ret = -EIO;
+            break;
+        }
+    }
+    if (!ret) ret = submit_bio_wait(bio);
+    bio_put(bio);
+    return ret;
+}
+
+struct fabriczc_folio_write {
+    struct completion done;
+    struct address_space *mapping;
+};
+
+/* Completes the writeback the caller started on every folio in the request. */
+static void fabriczc_folio_write_end(struct bio *bio)
+{
+    struct fabriczc_folio_write *w = bio->bi_private;
+    struct bvec_iter_all iter;
+    struct bio_vec *bv;
+
+    bio_for_each_segment_all(bv, bio, iter)
+        folio_end_writeback(page_folio(bv->bv_page));
+    if (bio->bi_status && w->mapping)
+        mapping_set_error(w->mapping, blk_status_to_errno(bio->bi_status));
+    complete(&w->done);
+}
+
+int fabriczc_write_folios(struct super_block *sb, u64 block, struct folio **folios,
+                          unsigned int n, struct address_space *mapping)
+{
+    struct fabriczc_folio_write w;
+    struct bio *bio;
+    unsigned int i;
+    int ret = 0;
+
+    if (unlikely(!sb || !sb->s_bdev || !folios || !n || n > FABRICZC_IO_MAX_BLOCKS))
+        return -EINVAL;
+
+    bio = bio_alloc(sb->s_bdev, (unsigned short)n, REQ_OP_WRITE | REQ_SYNC, GFP_NOFS);
+    if (!bio) return -ENOMEM;
+    bio->bi_iter.bi_sector = (sector_t)block << (sb->s_blocksize_bits - 9);
+    for (i = 0; i < n; i++) {
+        if (bio_add_page(bio, folio_page(folios[i], 0), PAGE_SIZE, 0) != PAGE_SIZE) {
+            ret = -EIO;
+            break;
+        }
+    }
+    if (ret) { bio_put(bio); return ret; }
+
+    init_completion(&w.done);
+    w.mapping = mapping;
+    bio->bi_private = &w;
+    bio->bi_end_io = fabriczc_folio_write_end;
+    submit_bio(bio);
+    wait_for_completion_io(&w.done);
+    ret = blk_status_to_errno(bio->bi_status);
+    bio_put(bio);
+    return ret;
+}
+
+/* --- Pipelined sequential writes -------------------------------------- */
+
+static void fabriczc_pipe_end(struct bio *bio)
+{
+    complete((struct completion *)bio->bi_private);
+}
+
+int fabriczc_io_pipe_init(struct fabriczc_io_pipe *pipe, struct super_block *sb)
+{
+    unsigned int i;
+
+    if (unlikely(!pipe || !sb)) return -EINVAL;
+    memset(pipe, 0, sizeof(*pipe));
+    pipe->sb = sb;
+    pipe->buf = vmalloc((size_t)FABRICZC_IO_DEPTH * FABRICZC_IO_MAX_BLOCKS * 4096);
+    if (!pipe->buf) return -ENOMEM;
+    for (i = 0; i < FABRICZC_IO_DEPTH; i++)
+        init_completion(&pipe->done[i]);
+    return 0;
+}
+
+/* Reap the slot if an earlier write is still using it, then hand it over. */
+char *fabriczc_io_pipe_acquire(struct fabriczc_io_pipe *pipe)
+{
+    unsigned int s = pipe->slot;
+
+    if (pipe->bio[s]) {
+        wait_for_completion_io(&pipe->done[s]);
+        if (pipe->bio[s]->bi_status && !pipe->error)
+            pipe->error = blk_status_to_errno(pipe->bio[s]->bi_status);
+        bio_put(pipe->bio[s]);
+        pipe->bio[s] = NULL;
+    }
+    return pipe->buf + (size_t)s * FABRICZC_IO_MAX_BLOCKS * 4096;
+}
+
+int fabriczc_io_pipe_submit(struct fabriczc_io_pipe *pipe, u64 block,
+                            unsigned int nblocks)
+{
+    unsigned int s = pipe->slot, i;
+    char *buf = pipe->buf + (size_t)s * FABRICZC_IO_MAX_BLOCKS * 4096;
+    struct super_block *sb = pipe->sb;
+    struct bio *bio;
+
+    if (unlikely(!nblocks || nblocks > FABRICZC_IO_MAX_BLOCKS)) return -EINVAL;
+
+    bio = bio_alloc(sb->s_bdev, (unsigned short)nblocks, REQ_OP_WRITE | REQ_SYNC,
+                    GFP_NOFS);
+    if (!bio) return -ENOMEM;
+    bio->bi_iter.bi_sector = (sector_t)block << (sb->s_blocksize_bits - 9);
+    for (i = 0; i < nblocks; i++) {
+        struct page *pg = vmalloc_to_page(buf + ((size_t)i << PAGE_SHIFT));
+
+        if (!pg || bio_add_page(bio, pg, PAGE_SIZE, 0) != PAGE_SIZE) {
+            bio_put(bio);
+            return -EIO;
+        }
+    }
+    init_completion(&pipe->done[s]);
+    bio->bi_private = &pipe->done[s];
+    bio->bi_end_io = fabriczc_pipe_end;
+    pipe->bio[s] = bio;
+    submit_bio(bio);
+    pipe->slot = (s + 1) % FABRICZC_IO_DEPTH;
+    return 0;
+}
+
+int fabriczc_io_pipe_drain(struct fabriczc_io_pipe *pipe)
+{
+    unsigned int i;
+
+    if (unlikely(!pipe)) return -EINVAL;
+    for (i = 0; i < FABRICZC_IO_DEPTH; i++) {
+        if (!pipe->bio[i]) continue;
+        wait_for_completion_io(&pipe->done[i]);
+        if (pipe->bio[i]->bi_status && !pipe->error)
+            pipe->error = blk_status_to_errno(pipe->bio[i]->bi_status);
+        bio_put(pipe->bio[i]);
+        pipe->bio[i] = NULL;
+    }
+    return pipe->error;
+}
+
+void fabriczc_io_pipe_exit(struct fabriczc_io_pipe *pipe)
+{
+    if (unlikely(!pipe)) return;
+    fabriczc_io_pipe_drain(pipe);
+    vfree(pipe->buf);
+    pipe->buf = NULL;
 }
 
 struct buffer_head *fabriczc_load_block_bitmap(struct super_block *sb, unsigned int block_group_idx, struct fabriczc_block_group_desc *desc) { return NULL; }

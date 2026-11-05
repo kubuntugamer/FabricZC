@@ -71,28 +71,56 @@ out:
     return ret;
 }
 
+/* Reap the writes a run left in flight; the first error wins. */
+static int fabriczc_reap_writes(struct buffer_head **batch, unsigned int *nr)
+{
+    unsigned int i;
+    int ret = 0;
+
+    for (i = 0; i < *nr; i++) {
+        int err = fabriczc_write_block_wait(batch[i]);
+
+        if (!ret && err) ret = err;
+    }
+    *nr = 0;
+    return ret;
+}
+
 /*
- * Writeback for pages dirtied through mmap(MAP_SHARED).
+ * Writeback for pages dirtied through mmap(MAP_SHARED) and through write(2).
  *
- * The buffer_head/mpage machinery is deliberately avoided: it maps pages
- * through fabriczc_get_block() and surfaced -EIO on the first msync(). Here the
- * dirty folio is written with the same fabriczc_bmap_block()/fabriczc_write_block()
- * pair the read and write paths use, so a shared store lands exactly where
- * fabriczc_read_folio() will look for it.
+ * Blocks are submitted without waiting (fabriczc_write_block_submit) and reaped
+ * one batch later, so a sequential write keeps the device queue fed. Doing one
+ * synchronous 4 KiB write per block left the array at 63 MB/s against a
+ * measured 649 MB/s raw ceiling.
+ *
+ * The folio is still mapped with the same fabriczc_bmap_block() the read path
+ * uses, so a shared store lands exactly where fabriczc_read_folio() looks.
  */
 static int fabriczc_writepages(struct address_space *mapping,
                                struct writeback_control *wbc)
 {
+    struct inode *inode = mapping->host;
+    struct fabriczc_inode *raw = inode ? inode->i_private : NULL;
+    struct buffer_head *batch[FABRICZC_WRITE_BATCH];
+    unsigned int nbatch = 0;
+    struct blk_plug plug;
     struct folio *folio;
+    char *tail = NULL;
     pgoff_t index = 0;
     int ret = 0;
 
-    xa_for_each(&mapping->i_pages, index, folio) {
-        struct inode *inode;
-        struct fabriczc_inode *raw;
+    if (!raw) return -EIO;
+    if (wbc->nr_to_write <= 0) return 0;
+    /* Start where writeback was asked to start; rescanning from page 0 on
+     * every call made a large file quadratic in the number of dirty pages. */
+    if (wbc->range_start > 0)
+        index = (pgoff_t)(wbc->range_start >> PAGE_SHIFT);
+
+    blk_start_plug(&plug);
+    xa_for_each_range(&mapping->i_pages, index, folio, index, ULONG_MAX) {
         loff_t pos;
         size_t fsize, done;
-        char *buf;
 
         if (wbc->nr_to_write <= 0) break;
         if (!folio_trylock(folio)) continue;
@@ -100,9 +128,7 @@ static int fabriczc_writepages(struct address_space *mapping,
             folio_unlock(folio);
             continue;
         }
-        inode = mapping->host;
-        raw = inode ? inode->i_private : NULL;
-        if (!raw || !folio_clear_dirty_for_io(folio)) {
+        if (!folio_clear_dirty_for_io(folio)) {
             folio_unlock(folio);
             continue;
         }
@@ -111,31 +137,150 @@ static int fabriczc_writepages(struct address_space *mapping,
         folio_start_writeback(folio);
         folio_unlock(folio);
 
-        buf = kmalloc(4096, GFP_NOFS);
-        if (!buf) { folio_end_writeback(folio); ret = -ENOMEM; break; }
         for (done = 0; done < fsize; done += 4096) {
             loff_t p = pos + done;
             size_t n = min_t(size_t, fsize - done, 4096);
+            struct buffer_head *bh;
+            const void *src;
             u64 phys;
 
             if (p >= raw->i_size_bytes) break; /* nothing past EOF to persist */
             ret = fabriczc_bmap_block(inode, (u64)(p >> 12), &phys, true);
             if (ret) break;
-            memcpy(buf, folio_address(folio) + done, n);
-            if (n < 4096) memset(buf + n, 0, 4096 - n);
-            ret = fabriczc_write_block(inode->i_sb, phys, buf, 4096);
-            if (ret) break;
+            if (n == 4096) {
+                src = folio_address(folio) + done;
+            } else {
+                if (!tail && !(tail = kmalloc(4096, GFP_NOFS))) {
+                    ret = -ENOMEM;
+                    break;
+                }
+                memcpy(tail, folio_address(folio) + done, n);
+                memset(tail + n, 0, 4096 - n);
+                src = tail;
+            }
+            bh = fabriczc_write_block_submit(inode->i_sb, phys, src, 4096);
+            if (IS_ERR(bh)) { ret = (int)PTR_ERR(bh); break; }
+            batch[nbatch++] = bh;
+            if (nbatch == FABRICZC_WRITE_BATCH) {
+                ret = fabriczc_reap_writes(batch, &nbatch);
+                if (ret) break;
+            }
         }
-        kfree(buf);
         folio_end_writeback(folio);
         if (ret) { mapping_set_error(mapping, ret); break; }
         wbc->nr_to_write -= fsize >> PAGE_SHIFT;
     }
+    blk_finish_plug(&plug);
+
+    if (!ret) ret = fabriczc_reap_writes(batch, &nbatch);
+    kfree(tail);
+
+    /*
+     * The block mapping above leaves inode slots and index tables dirty in the
+     * buffer cache (they are rewritten once per mapped block, so they are not
+     * flushed one at a time). Flushing them here for durability is correct but
+     * a device flush per writeback batch serialises every writer on the box: it
+     * measured 169 MB/s with four writers against 259 MB/s with one. Only flush
+     * when the caller is asking for durability (fsync/sync), and let background
+     * writeback fold the metadata into its normal flush.
+     */
+    if (!ret && wbc->sync_mode == WB_SYNC_ALL && inode->i_sb->s_bdev)
+        sync_blockdev(inode->i_sb->s_bdev);
     return ret;
+}
+
+/* Drain a readahead window straight into the page cache. */
+static void fabriczc_zero_folio(struct folio *folio)
+{
+    folio_zero_range(folio, 0, folio_size(folio));
+    folio_mark_uptodate(folio);
+}
+
+/*
+ * Batched readahead. read_folio() can only fill the single folio it is handed,
+ * so routing sequential reads through it issued one 4 KiB request at a time and
+ * left the device queue idle; that is where 320 MB/s came from. A whole window
+ * of physically contiguous blocks is submitted as one batch instead.
+ */
+static void fabriczc_readahead(struct readahead_control *rac)
+{
+    struct inode *inode = rac->mapping->host;
+    struct fabriczc_inode *raw = inode ? inode->i_private : NULL;
+    struct super_block *sb = inode ? inode->i_sb : NULL;
+    struct folio *carry = NULL;
+
+    if (!raw || !sb) {
+        struct folio *f;
+
+        while ((f = readahead_folio(rac)))
+            folio_unlock(f); /* left !uptodate: read_folio() retries it */
+        return;
+    }
+
+    while (carry || readahead_count(rac)) {
+        struct buffer_head *bhs[FABRICZC_READAHEAD_BATCH];
+        struct folio *folios[FABRICZC_READAHEAD_BATCH];
+        unsigned int n = 0, i;
+        u64 first = 0;
+
+        while (n < FABRICZC_READAHEAD_BATCH) {
+            struct folio *f = carry;
+            loff_t pos;
+            u64 phys = FABRICZC_BLOCK_FREE;
+            int err;
+
+            carry = NULL;
+            if (!f && !(f = readahead_folio(rac))) break;
+            pos = folio_pos(f);
+            if (folio_size(f) != PAGE_SIZE) {
+                /* Not a block-aligned window; let read_folio() take it. */
+                if (n) { carry = f; break; }
+                folio_unlock(f);
+                continue;
+            }
+            if (pos >= READ_ONCE(raw->i_size_bytes)) {
+                err = -ENOENT;
+            } else {
+                err = fabriczc_bmap_block(inode, (u64)(pos >> PAGE_SHIFT),
+                                          &phys, false);
+                if (!err && phys == FABRICZC_BLOCK_FREE) err = -ENOENT;
+            }
+            if (err) {
+                /* Hole or EOF: zero-fill, but never in the middle of a run. */
+                if (n) { carry = f; break; }
+                if (err == -ENOENT) {
+                    fabriczc_zero_folio(f);
+                } else {
+                    mapping_set_error(rac->mapping, err);
+                }
+                folio_unlock(f);
+                continue;
+            }
+            if (n && phys != first + n) { carry = f; break; }
+            if (!n) first = phys;
+            folios[n++] = f;
+        }
+        if (!n) break;
+
+        for (i = 0; i < n; i++)
+            bhs[i] = sb_getblk(sb, (sector_t)(first + i));
+        bh_read_batch((int)n, bhs);
+        for (i = 0; i < n; i++) {
+            if (likely(buffer_uptodate(bhs[i]))) {
+                memcpy(folio_address(folios[i]), bhs[i]->b_data, PAGE_SIZE);
+                folio_mark_uptodate(folios[i]);
+            } else {
+                mapping_set_error(rac->mapping, -EIO);
+            }
+            brelse(bhs[i]);
+            folio_unlock(folios[i]);
+        }
+    }
 }
 
 static const struct address_space_operations fabriczc_aops = {
     .read_folio  = fabriczc_read_folio,
+    .readahead   = fabriczc_readahead,
     .writepages  = fabriczc_writepages,
     .dirty_folio = filemap_dirty_folio,
 };
@@ -1640,6 +1785,8 @@ static int fabriczc_persist_free_blocks(struct super_block *sb)
 static int fabriczc_sync_fs(struct super_block *sb, int wait)
 {
     (void)wait;
+    /* Unused reservation bits must go back before the bitmap is trusted. */
+    fabriczc_drop_reservation(sb);
     return fabriczc_persist_free_blocks(sb);
 }
 
@@ -1654,6 +1801,7 @@ void fabriczc_put_super(struct super_block *sb)
 
     if (!sbi) return;
 
+    fabriczc_drop_reservation(sb);
     fabriczc_persist_free_blocks(sb);
 
     kfree(sbi);

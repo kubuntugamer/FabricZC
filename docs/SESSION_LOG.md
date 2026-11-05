@@ -313,3 +313,78 @@ session (or person) knows what changed, what was verified, and what is still ope
 - `mokutil --sb-state` reports "EFI variables are not supported on this
   system", so this host is not booted via UEFI and Secure Boot signing is
   neither active nor tested.
+
+## 2026-11-04 19:45 — Write/read throughput: measuring the hardware, fixing the 4 KiB path
+
+Started from the complaint that 63 MB/s write / 320 MB/s read is unacceptable.
+Measured the array itself first, so the filesystem is not blamed for the disk:
+
+- Raw write, 1 MiB, `oflag=direct`, through the ESP: **649 MB/s** (the ESP is on
+  the same array, and its 1 GiB size caps this test).
+- Raw read, `/dev/hptblock6n0p2`, 1 MiB, `iflag=direct`: **4.9 GB/s**.
+- `fio` on the raw block device (installed for this), io_uring, O_DIRECT:
+  1 MiB at iodepth 32 → **4433 MiB/s**; 4 KiB at iodepth 32 → 324k IOPS
+  (1267 MiB/s). Offsets used were 15,000,000,000,000 and 15,100,000,000,000
+  bytes, i.e. free data blocks; `mkfs_fabriczc.py` writes no trailing metadata
+  (checked with `grep -nE "seek|backup"`), and the device was unmounted.
+
+So the hardware was never the problem. What was:
+
+1. `fabriczc_alloc_data_block()` claimed one bitmap bit per call and synced that
+   bitmap block every time — a read plus a synchronous write per 4 KiB of data.
+   Now `fabriczc_claim_bitmap_run()` claims up to 512 contiguous free bits with
+   one bitmap write (`sbi->reserve_start`/`reserve_count` cache the window).
+   Leftover reserved bits are released by `fabriczc_drop_reservation()` from
+   `sync_fs()` and `put_super()`.
+2. Block mapping rewrote the inode slot synchronously for every newly mapped
+   block, plus the index table. Both are now deferred dirty buffers
+   (`fabriczc_inode_slot_write_deferred()`); `fsync()`/`sync()`/unmount flush
+   them via the existing `sync_blockdev()`.
+3. `writepages` submitted one synchronous 4 KiB write per block. It now submits
+   asynchronously (`fabriczc_write_block_submit()`) and reaps a batch of 64.
+4. Reads went through `read_folio` one 4 KiB `sb_bread()` at a time. Added
+   `->readahead` which submits a whole physically contiguous window with
+   `bh_read_batch()` and copies into the folios.
+5. First version of (3) called `sync_blockdev()` at the end of every writeback
+   batch, which serialised all writers on the box: four writers measured
+   **169 MiB/s**. Restricted to `WB_SYNC_ALL` (fsync/sync) → four writers
+   **910 MiB/s**.
+
+Results on `/dev/hptblock6n0p2`, mounted with a plain `insmod` (no `target=`):
+
+- `dd bs=1M count=4096 conv=fsync`: 63 MB/s → **259 MB/s**; read back (caches
+  dropped) 320 → 306 MB/s at that point.
+- `fio --ioengine=io_uring --rw=write --bs=1M --size=4G --iodepth=32`: **259 MiB/s**,
+  then **264 MiB/s** after (5). Read with io_uring: **800 MiB/s** (was 320).
+- `fio` 4 jobs × 1 GiB, io_uring: 169 MiB/s → **910 MiB/s**.
+- The 4 GiB file written by this build md5-matches 4 GiB of zeros
+  (`c9a5a6878d97b48cc965c1e41859f034`) after unmount and remount.
+- `scripts/fzc_smoke_test.sh` 11/11 and `scripts/fzc_scale_test.sh` 6/6 pass on
+  the loop image with this code (before change (5), which is a durability-policy
+  change only).
+
+io_uring needed no work of its own: it is not an fs-layer interface, and the
+VFS already routes its read/write/fsync into the same `file_operations` and
+`address_space_operations`. The measurements above are io_uring clients.
+
+Answers to "is it implemented": no io_uring code exists in the module and none
+is needed for file I/O on a filesystem.
+
+Still open, in this order:
+
+- `fabriczc_write_iter()` is now the bottleneck: it maps and writes **one
+  synchronous 4 KiB block per call** and is the path `write(2)`/fio/dd use. That
+  is the remaining 264 MiB/s. A block-request layer was started in
+  `src/fs/metadata_io.c` (`fabriczc_read_blocks()`, `fabriczc_write_blocks()`,
+  `fabriczc_read_folios()`, `fabriczc_write_folios()`,
+  `fabriczc_io_pipe_*`, all built and compiling) but is **not wired into any
+  caller yet**. Wiring it means: `write_iter` building 1 MiB runs through
+  `fabriczc_io_pipe_submit()`, `read_folio`/`readahead` using
+  `fabriczc_read_folios()`, `writepages` using `fabriczc_write_folios()`, and
+  `fallocate` zero-filling through `fabriczc_write_blocks()`. Data blocks would
+  then leave the buffer cache entirely, so an allocation must also drop any
+  stale buffered copy (`sb_find_get_block` + clear uptodate) when a block
+  changes role.
+- No page-cache writeback path for `write(2)`: data goes straight to the device
+  and the inode's cached pages are invalidated afterwards, which is why reads
+  had to stay coherent with it.
