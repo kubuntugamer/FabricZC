@@ -38,3 +38,20 @@ sudo scripts/fzc_smoke_test.sh
 ```bash
 sudo scripts/fzc_scale_test.sh [image-size] [file-size]   # default 6G 1G
 ```
+
+## 🥾 Booting a FabricZC root
+
+GRUB cannot read FabricZC, so keep the kernel and initrd where it can read them
+(the FAT32 ESP, or a small ext4 `/boot`), and put `fabriczc_mod.ko` inside the
+initramfs so root can be mounted before `switch_root`:
+
+```bash
+sudo cp boot/initramfs/hook-fabriczc /etc/initramfs-tools/hooks/
+sudo make modules_install
+sudo update-initramfs -u
+```
+
+`root=/dev/<node> rootfstype=fabriczc` then works with no module parameter — the
+filesystem mounts whatever device it is given. Under Secure Boot the module must
+be signed and its key enrolled (MOK), or Secure Boot must be disabled; Ubuntu
+kernels refuse unsigned modules and the boot dies at `VFS: Unable to mount root fs`.

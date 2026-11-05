@@ -1,0 +1,36 @@
+#!/bin/sh
+# initramfs-tools hook: put fabriczc_mod.ko in the initramfs and load it
+# before the root filesystem is mounted, so rootfstype=fabriczc can work.
+#
+# Install: cp boot/initramfs/hook-fabriczc /etc/initramfs-tools/hooks/
+#          make modules_install && update-initramfs -u
+#
+# FABRICZC_KO overrides the module location, which defaults to the path
+# `make modules_install` uses.
+
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case $1 in
+	prereqs)
+		prereqs
+		exit 0
+		;;
+esac
+
+. /usr/share/initramfs-tools/hook-functions
+
+KO="${FABRICZC_KO:-/lib/modules/${version}/extra/fabriczc_mod.ko}"
+
+if [ ! -f "$KO" ]; then
+	echo "fabriczc: $KO not found; run 'make modules_install' first" >&2
+	exit 1
+fi
+
+mkdir -p "${DESTDIR}/lib/modules/${version}/extra"
+cp "$KO" "${DESTDIR}/lib/modules/${version}/extra/fabriczc_mod.ko"
+depmod -b "${DESTDIR}" "${version}"
+
+# /conf/modules is what initramfs-tools' init script modprobes at boot.
+mkdir -p "${DESTDIR}/conf"
+grep -qx 'fabriczc_mod' "${DESTDIR}/conf/modules" 2>/dev/null ||
+	echo 'fabriczc_mod' >> "${DESTDIR}/conf/modules"

@@ -269,3 +269,20 @@ session (or person) knows what changed, what was verified, and what is still ope
   not the device under it.
 - `src/kernel/driver/main.c` still registers a disk named `rcraid` and is still
   absent from the Makefile.
+
+## 2026-11-04 18:25 — Initramfs hook for the module
+
+- Added `boot/initramfs/hook-fabriczc`: an initramfs-tools hook that copies
+  `fabriczc_mod.ko` into the image, runs `depmod` on it, and appends
+  `fabriczc_mod` to the image's `/conf/modules` so initramfs-tools modprobes it
+  before root mount. `FABRICZC_KO` overrides the source path.
+- Verified by building a throwaway image with a private config dir
+  (`mkinitramfs -d /var/tmp/fzc-initrd -o /var/tmp/fzc-test.initrd`,
+  `MODULES=list`), not by touching `/boot`:
+  - `lsinitramfs` shows `usr/lib/modules/7.3.0-10-generic/extra/fabriczc_mod.ko`;
+  - the extracted `conf/modules` contains `fabriczc_mod`;
+  - `modules.dep` has `extra/fabriczc_mod.ko:` with no dependencies, so
+    `modprobe` succeeds without pulling anything else.
+- Not verified: an actual boot into a FabricZC root, module signing/MOK under
+  Secure Boot, and firmware/GRUB entries. The module was never loaded from an
+  initramfs in this session.
