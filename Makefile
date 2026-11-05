@@ -14,6 +14,13 @@ all:
 	@cp -f fabriczc_mod.ko $(OUT)/
 	@mv -f src/core/*.o src/fs/*.o .*.cmd *.mod.c *.mod *.o modules.order Module.symvers $(OUT)/ 2>/dev/null || true
 
+INSTALL_MOD_DIR ?= extra
+
+modules_install: all
+	@install -D -m 644 $(OUT)/fabriczc_mod.ko \
+		$(DESTDIR)/lib/modules/$(shell uname -r)/$(INSTALL_MOD_DIR)/fabriczc_mod.ko
+	@depmod -a $(shell uname -r)
+
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
 	@rm -rf build/modules/* .*.cmd *.mod.c *.mod *.o *.ko modules.order Module.symvers .tmp_versions

@@ -286,3 +286,30 @@ session (or person) knows what changed, what was verified, and what is still ope
 - Not verified: an actual boot into a FabricZC root, module signing/MOK under
   Secure Boot, and firmware/GRUB entries. The module was never loaded from an
   initramfs in this session.
+
+## 2026-11-04 18:40 — The array itself is partitioned, formatted and mounted
+
+- Pre-flight on `/dev/hptblock6n0p`: no partitions, no filesystem, nothing
+  mounted, no holders, only a stale GPT backup header at the end of the disk
+  (no primary header, empty entry array). Replaced it with a fresh GPT.
+- Layout: `p1` 1 GiB FAT32, name `ESP`, `esp` flag, label `FABRICZCESP`;
+  `p2` the remaining 14.55 TiB, name `FabricZC`.
+- `mkfs_fabriczc.py /dev/hptblock6n0p2` → 3,906,665,984 blocks, bitmap 119,222
+  blocks, inode table 61,041,656 blocks (232.8 GiB, 976,666,496 slots), data
+  region 14.3 TiB. Whole-partition format took roughly three minutes; the
+  zeroing loop ran at page-cache speed and writeback kept up.
+- Mounted with a plain `insmod fabriczc_mod.ko` (no `target=`) on
+  `/dev/hptblock6n0p2`: `df -hT` reports 15T, 234G used, 15T available.
+- Real I/O: 4 GiB `dd ... conv=fsync` → 63 MB/s; read back → 320 MB/s; md5
+  identical (`c9a5a6878d97b48cc965c1e41859f034`) after unmount and remount. The
+  63 MB/s write rate is poor for this array and is not investigated yet.
+- ESP mounts as vfat, 1022 MiB free.
+- Installed for real: `make modules_install` (new Makefile target — it did not
+  exist, so the first `update-initramfs -u` correctly aborted with the original
+  initrd untouched), hook copied to `/etc/initramfs-tools/hooks/`, then
+  `update-initramfs -u`. `/boot/initrd.img-7.3.0-10-generic` now contains
+  `extra/fabriczc_mod.ko`, `/conf/modules` lists `fabriczc_mod`, and
+  `modules.dep` has it with no dependencies.
+- `mokutil --sb-state` reports "EFI variables are not supported on this
+  system", so this host is not booted via UEFI and Secure Boot signing is
+  neither active nor tested.
