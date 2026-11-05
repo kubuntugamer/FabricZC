@@ -25,14 +25,14 @@ static int fabriczc_major = 0;
 static dev_t host_os_dev = 0;
 
 /*
- * Backing volume the filesystem layer reads and writes. This host presents its
- * NVMe array through the HighPoint hptnvme driver as /dev/hptblock6n0p; the
- * previous default ("rcraid0") was a leftover from the early stub and named an
- * AMD driver that is not involved here. Override with target=/dev/<node>.
+ * Optional, and off by default: a pass-through block device left over from the
+ * Layer-1 hardware path. The filesystem does not use it and must not depend on
+ * it - mount(2) hands the filesystem its device, exactly as for ext4 or xfs -
+ * so nothing here names hardware unless someone asks for it explicitly.
  */
-static char *fabriczc_target = "/dev/hptblock6n0p";
+static char *fabriczc_target;
 module_param_named(target, fabriczc_target, charp, 0444);
-MODULE_PARM_DESC(target, "Backing block device (default: /dev/hptblock6n0p, the hptnvme array volume)");
+MODULE_PARM_DESC(target, "Optional legacy pass-through device; the filesystem does not need it");
 
 
 struct fabriczc_runtime_context *fabriczc_get_runtime_ctx(void)
@@ -138,14 +138,16 @@ static int __init fabriczc_core_init(void)
         spin_lock_init(&core_ctx.allocation_locks[i]);
     }
 
-    ret = fabriczc_register_block_layer(&fabriczc_major);
-    if (ret < 0) {
-        pr_err("FabricZC: Registration failed\n");
-        return ret;
-    }
+    if (fabriczc_target && *fabriczc_target) {
+        ret = fabriczc_register_block_layer(&fabriczc_major);
+        if (ret < 0) {
+            pr_err("FabricZC: Registration failed\n");
+            return ret;
+        }
 
-    fabriczc_audit_host_os_identity();
-    fabriczc_discover_hardware_targets();
+        fabriczc_audit_host_os_identity();
+        fabriczc_discover_hardware_targets();
+    }
 
     ret = fabriczc_fs_init();
     if (ret < 0) {
@@ -160,7 +162,8 @@ static void __exit fabriczc_core_exit(void)
 {
     fabriczc_fs_exit();
     if (core_ctx.bdev_file_ptr) { bdev_fput(core_ctx.bdev_file_ptr); core_ctx.bdev_file_ptr = NULL; }
-    fabriczc_unregister_block_layer(fabriczc_major);
+    if (fabriczc_major > 0)
+        fabriczc_unregister_block_layer(fabriczc_major);
     pr_info("FabricZC: Unregistering Layer 1 Core Engine Setup Complete\n");
 }
 

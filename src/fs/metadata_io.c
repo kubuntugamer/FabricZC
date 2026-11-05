@@ -17,31 +17,7 @@ int fabriczc_verify_superblock(struct fabriczc_superblock *sb)
     return 0;
 }
 
-int fabriczc_read_metadata_block(u64 block_index, void *buffer_data)
-{
-    struct fabriczc_runtime_context *ctx = fabriczc_get_runtime_ctx();
-    loff_t pos = block_index * 4096;
-    if (unlikely(!buffer_data || !ctx || !ctx->bdev_file_ptr)) return -EINVAL;
-    if (kernel_read(ctx->bdev_file_ptr, buffer_data, 4096, &pos) != 4096) return -EIO;
-    return 0;
-}
 
-int fabriczc_flush_metadata_block(u64 block_index, void *buffer_data)
-{
-    struct fabriczc_runtime_context *ctx = fabriczc_get_runtime_ctx();
-    struct bio *bio;
-    struct page *page;
-    if (unlikely(!buffer_data || !ctx || !ctx->bdev)) return -EINVAL;
-    page = virt_to_page(buffer_data);
-    if (!page) return -EFAULT;
-    bio = bio_alloc(ctx->bdev, 1, REQ_OP_WRITE | REQ_SYNC | REQ_META, GFP_NOIO);
-    if (!bio) return -ENOMEM;
-    bio->bi_iter.bi_sector = block_index * 8;
-    if (bio_add_page(bio, page, 4096, offset_in_page(buffer_data)) != 4096) {
-        bio_put(bio); return -EIO;
-    }
-    return fabriczc_submit_raw_bio(bio);
-}
 
 int fabriczc_mount_journal(struct super_block *sb, u64 journal_block)
 {
@@ -641,22 +617,46 @@ int fabriczc_get_block(struct inode *inode, sector_t iblock, struct buffer_head 
     return 0;
 }
 
+/*
+ * Metadata I/O goes through the mounted superblock's own device, never a
+ * module-global one. A filesystem must work on whatever block device mount(2)
+ * was given, the same as every other filesystem; reaching for a device the
+ * module discovered by itself meant the image could only ever be mounted on the
+ * synthetic /dev/fabriczc0 node.
+ *
+ * Writes are synchronous: metadata callers assume the block is on the medium
+ * when this returns, and the format has no journal to order deferred writes.
+ */
 int fabriczc_read_block(struct super_block *sb, u64 block, void *buf, u32 len)
 {
-    u64 pos = (u64)block * 4096;
-    struct fabriczc_runtime_context *ctx = fabriczc_get_runtime_ctx();
-    if (unlikely(len > 4096 || !ctx || !ctx->bdev_file_ptr)) return -EINVAL;
-    if (kernel_read(ctx->bdev_file_ptr, buf, len, &pos) != len) return -EIO;
+    struct buffer_head *bh;
+
+    if (unlikely(!sb || !sb->s_bdev || !buf || len > sb->s_blocksize))
+        return -EINVAL;
+
+    bh = sb_bread(sb, (sector_t)block);
+    if (!bh) return -EIO;
+    memcpy(buf, bh->b_data, len);
+    brelse(bh);
     return 0;
 }
 
 int fabriczc_write_block(struct super_block *sb, u64 block, const void *buf, u32 len)
 {
-    u64 pos = (u64)block * 4096;
-    struct fabriczc_runtime_context *ctx = fabriczc_get_runtime_ctx();
-    if (unlikely(len > 4096 || !ctx || !ctx->bdev_file_ptr)) return -EINVAL;
-    if (kernel_write(ctx->bdev_file_ptr, buf, len, &pos) != len) return -EIO;
-    return 0;
+    struct buffer_head *bh;
+    int ret;
+
+    if (unlikely(!sb || !sb->s_bdev || !buf || len > sb->s_blocksize))
+        return -EINVAL;
+
+    bh = sb_getblk(sb, (sector_t)block);
+    if (!bh) return -ENOMEM;
+    memcpy(bh->b_data, buf, len);
+    set_buffer_uptodate(bh);
+    mark_buffer_dirty(bh);
+    ret = sync_dirty_buffer(bh);
+    brelse(bh);
+    return ret;
 }
 
 struct buffer_head *fabriczc_load_block_bitmap(struct super_block *sb, unsigned int block_group_idx, struct fabriczc_block_group_desc *desc) { return NULL; }

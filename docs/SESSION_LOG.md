@@ -239,3 +239,33 @@ session (or person) knows what changed, what was verified, and what is still ope
   old standalone staging driver that registers a disk named `rcraid` and prints
   a "40.8 GB storage array". It is where the rcraid naming came from; it was
   left untouched rather than deleted.
+
+## 2026-11-04 18:20 — The filesystem no longer names any device
+
+- Root cause of the hardware coupling: `fabriczc_read_block()` and
+  `fabriczc_write_block()` read and wrote through
+  `fabriczc_get_runtime_ctx()->bdev_file_ptr`, a pointer filled by the module's
+  own hardware scan, instead of through the mounted superblock. A formatted
+  image could therefore only be mounted on the synthetic `/dev/fabriczc0`;
+  mounting the device itself used the wrong backing pointer. The `target=`
+  default and the scan were symptoms, not the cause.
+- Metadata I/O now uses the mounted superblock's buffer cache
+  (`sb_bread()` / `sb_getblk()` + `sync_dirty_buffer()`), and the free-block
+  counter is synced through `sb->s_bdev`. The unused
+  `fabriczc_read_metadata_block()`/`fabriczc_flush_metadata_block()` raw helpers
+  were deleted; they were device-global by construction.
+- `target=` is unset by default and the legacy pass-through block layer is only
+  registered when a path is passed, so a plain `insmod` binds no hardware and
+  creates no block device.
+- Both test scripts now mount the loop device directly. Verified:
+  `sudo scripts/fzc_smoke_test.sh` → 11/11 (including an assertion that no
+  `/dev/fabriczc0` appears) and `sudo scripts/fzc_scale_test.sh` → 6/6.
+- Throughput after the change, 2 GiB image, `conv=fsync`: 1 MiB blocks
+  92/92/76 MiB/s, 4 KiB blocks 77 MiB/s; raw loop device 111–126 MB/s
+  (106–120 MiB/s). One scale-test run reported 47 MiB/s, which the controlled
+  A/B did not reproduce; recorded as host cache variance, not a regression.
+- Corrected earlier mistake: a raw `dd` to the loop device overwrites the
+  superblock at block 2 and breaks the mounted image; benchmark the filesystem,
+  not the device under it.
+- `src/kernel/driver/main.c` still registers a disk named `rcraid` and is still
+  absent from the Makefile.

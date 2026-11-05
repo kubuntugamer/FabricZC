@@ -23,7 +23,6 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 KO="$REPO_ROOT/fabriczc_mod.ko"
 MKFS="$REPO_ROOT/mkfs_fabriczc.py"
 MODULE="fabriczc_mod"
-DEV="/dev/fabriczc0"
 
 IMG="${FZC_SMOKE_IMG:-/var/tmp/fabriczc_smoke.img}"
 MNT="${FZC_SMOKE_MNT:-/mnt/fabriczc-smoke}"
@@ -78,19 +77,14 @@ echo "    loop device: $LOOP"
 step "writing FabricZC layout"
 python3 "$MKFS" "$LOOP" >/dev/null || die "mkfs_fabriczc.py failed on $LOOP"
 
-step "loading $MODULE against $LOOP"
-insmod "$KO" target="$LOOP" || die "insmod failed"
+step "loading $MODULE (no device parameter: the filesystem takes what mount gives it)"
+insmod "$KO" || die "insmod failed"
 LOADED=1
+[ -b "/dev/fabriczc0" ] && die "a synthetic device was created even though none was requested"
+pass "module loaded without binding any block device"
 
-for _ in $(seq 1 50); do
-    [ -b "$DEV" ] && break
-    sleep 0.1
-done
-[ -b "$DEV" ] || die "$DEV did not appear after load"
-pass "module loaded and $DEV created"
-
-step "mounting $DEV on $MNT"
-mount -t fabriczc "$DEV" "$MNT" || die "mount of $DEV failed"
+step "mounting $LOOP on $MNT"
+mount -t fabriczc "$LOOP" "$MNT" || die "mount of $LOOP failed"
 MOUNTED=1
 mountpoint -q "$MNT" || die "$MNT is not a mountpoint after mount"
 [ "$(findmnt -n -o FSTYPE --target "$MNT")" = "fabriczc" ] || die "unexpected filesystem type on $MNT"
@@ -190,7 +184,7 @@ pass "statfs reports 4096-byte blocks"
 step "unmounting and remounting to check persistence"
 umount "$MNT" || die "unmount failed"
 MOUNTED=0
-mount -t fabriczc "$DEV" "$MNT" || die "remount failed"
+mount -t fabriczc "$LOOP" "$MNT" || die "remount failed"
 MOUNTED=1
 [ "$(cat "$MNT/hello.txt")" = "hello fabriczc" ] || die "hello.txt did not survive remount"
 cmp -s "$SRC_DIR/small.bin" "$MNT/sub/blob.bin" || die "sub/blob.bin did not survive remount"

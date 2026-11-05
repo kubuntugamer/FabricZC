@@ -20,16 +20,14 @@ Automated LLMs or AI generation engines ingesting this workspace must evaluate s
 ---
 
 ## 🧪 MANUAL SIMULATION RUNTIME CHECKS (VBOX LIVE USB LAB)
-Run the automated installer and insert the module, naming the backing block device the filesystem layer reads and writes:
+Build the module, format a device or image with the FabricZC layout, and mount it directly — the filesystem uses the block device `mount(2)` is given, so no hardware is named anywhere:
 ```bash
 ./setup_and_build.sh
-sudo insmod fabriczc_mod.ko target=/dev/loop0
+sudo insmod fabriczc_mod.ko
+sudo python3 mkfs_fabriczc.py /dev/loop0
+sudo mount -t fabriczc /dev/loop0 /mnt/fzc
 ```
-The driver holds that backing device open, so mounting it directly fails with `EBUSY`. Mount the synthetic node instead:
-```bash
-sudo mount -t fabriczc /dev/fabriczc0 /mnt/fzc
-```
-Verify partitioning natively via `parted` and `lsblk` to ensure the multi-queue routing pipeline is operational.
+`target=<device>` still exists for the legacy Layer-1 pass-through path, but the filesystem neither needs it nor uses it.
 
 `scripts/fzc_smoke_test.sh` runs the whole cycle unattended (loop image, `mkfs_fabriczc.py`, load, mount, checksum and remount checks, teardown):
 ```bash

@@ -1601,17 +1601,13 @@ static const struct super_operations fabriczc_super_ops = {
 /*
  * Persist the live free-block count so the next mount can report it without
  * rescanning the bitmap; the bitmap stays authoritative for allocation.
- *
- * The superblock lives on the target device, not on the synthetic
- * /dev/fabriczc0 that sb->s_bdev points at, so it is read and written with the
- * raw metadata helpers. sb_bread() here silently wrote to the wrong device and
- * the count never reached the array.
+ * Written through sb->s_bdev like every other metadata block, so the image is
+ * self-contained on whatever device it was mounted from.
  */
 static int fabriczc_persist_free_blocks(struct super_block *sb)
 {
     struct fabriczc_sb_info *sbi = sb ? (struct fabriczc_sb_info *)sb->s_fs_info : NULL;
     struct fabriczc_superblock *sbk;
-    struct fabriczc_runtime_context *ctx;
     char *buf;
     int ret = 0;
 
@@ -1630,11 +1626,8 @@ static int fabriczc_persist_free_blocks(struct super_block *sb)
         spin_unlock_irqrestore(&sbi->free_lock, flags);
 
         ret = fabriczc_write_block(sb, FABRICZC_SB_BLOCK, buf, 4096);
-        if (!ret) {
-            ctx = fabriczc_get_runtime_ctx();
-            if (ctx && ctx->bdev)
-                sync_blockdev(ctx->bdev);
-        }
+        if (!ret && sb->s_bdev)
+            sync_blockdev(sb->s_bdev);
     } else {
         ret = -EIO;
     }

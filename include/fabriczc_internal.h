@@ -38,8 +38,6 @@ struct fabriczc_inode;
 int fabriczc_verify_metadata(struct fabriczc_array_metadata *meta);
 int fabriczc_verify_superblock(struct fabriczc_superblock *sb);
 int fabriczc_find_and_allocate_inode(void *bitmap_page, unsigned int max_inodes_per_group);
-int fabriczc_read_metadata_block(u64 block_index, void *buffer_data);
-int fabriczc_flush_metadata_block(u64 block_index, void *buffer_data);
 
 struct buffer_head *fabriczc_load_block_bitmap(struct super_block *sb, 
                                                unsigned int block_group_idx,

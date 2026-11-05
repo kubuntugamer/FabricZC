@@ -22,7 +22,6 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 KO="$REPO_ROOT/fabriczc_mod.ko"
 MKFS="$REPO_ROOT/mkfs_fabriczc.py"
 MODULE="fabriczc_mod"
-DEV="/dev/fabriczc0"
 
 IMG="${FZC_SCALE_IMG:-/var/tmp/fabriczc_scale.img}"
 MNT="${FZC_SCALE_MNT:-/mnt/fabriczc-scale}"
@@ -90,17 +89,12 @@ echo "    loop device: $LOOP"
 step "writing FabricZC layout"
 python3 "$MKFS" "$LOOP" >/dev/null || die "mkfs_fabriczc.py failed on $LOOP"
 
-step "loading $MODULE against $LOOP"
-insmod "$KO" target="$LOOP" || die "insmod failed"
+step "loading $MODULE (no device parameter)"
+insmod "$KO" || die "insmod failed"
 LOADED=1
-for _ in $(seq 1 50); do
-    [ -b "$DEV" ] && break
-    sleep 0.1
-done
-[ -b "$DEV" ] || die "$DEV did not appear after load"
 
-step "mounting $DEV on $MNT"
-mount -t fabriczc "$DEV" "$MNT" || die "mount of $DEV failed"
+step "mounting $LOOP on $MNT"
+mount -t fabriczc "$LOOP" "$MNT" || die "mount of $LOOP failed"
 MOUNTED=1
 
 total_bytes=$(( $(stat -f -c '%b' "$MNT") * $(stat -f -c '%S' "$MNT") ))
@@ -170,7 +164,7 @@ PY
     step "remounting to check the >4 GiB block survived"
     umount "$MNT" || die "unmount failed"
     MOUNTED=0
-    mount -t fabriczc "$DEV" "$MNT" || die "remount failed"
+    mount -t fabriczc "$LOOP" "$MNT" || die "remount failed"
     MOUNTED=1
     if ! python3 - "$MNT/sparse.bin" <<'PY'
 import os, sys
